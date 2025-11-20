@@ -1,6 +1,6 @@
 # Higher or Lower Game (Python)
 
-**Higher or Lower** drinking game implemented in Python.  
+**Higher or Lower** drinking game implemented in Python.
 
 ## Game Logic
 
@@ -18,6 +18,7 @@
 You can test the connection by running the following commands in separate terminals:
 
 **1st terminal (server):**
+
 ```bash
 python3 server.py
 ```
