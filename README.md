@@ -22,3 +22,9 @@ You can test the connection by running the following commands in separate termin
 ```bash
 python3 server.py
 ```
+
+**other terminals (client):**
+
+```bash
+python3 client.py
+```
