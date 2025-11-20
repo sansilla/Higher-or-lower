@@ -18,7 +18,6 @@
 You can test the connection by running the following commands in separate terminals:
 
 **1st terminal (server):**
+```bash
 python3 server.py
-
-**other terminals (client):**
-python3 client.py
+```
