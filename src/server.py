@@ -15,6 +15,9 @@ clients = []
 client_ids = {}
 next_id = 1
 
+def send_ndjson(conn, obj):
+    conn.sendall((json.dumps(obj) + "\n").encode())
+
 def handle_client(conn, addr):
     global next_id
 
@@ -29,17 +32,17 @@ def handle_client(conn, addr):
     conn.recv(16)
 
     # send assigned ID
-    conn.send(json.dumps({"your_id": cid}).encode())
+    send_ndjson(conn, {"your_id": cid})
 
     # register client
     clients.append((cid, addr))
 
     # send peer list to everyone
-    peer_packet = json.dumps({"peers": clients}).encode()
-    for c, _ in clients:
+    peer_packet = {"peers": clients}
+    for c in list(client_ids.keys()):
         try:
-            [k.send(peer_packet) for k in client_ids if client_ids[k] == c]
-        except:
+            send_ndjson(c, peer_packet)
+        except Exception:
             pass
 
 while True:
