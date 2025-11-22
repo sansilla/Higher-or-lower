@@ -16,4 +16,20 @@ EVENT_NEW_LEADER = "NEW_LEADER"
 
 current_event_id = 0
 
-#def make_event(?):
+def make_event(event_name, payload, sender):
+    """
+    Constructs a standard event. event_name: str (e.g. TURN_START),
+    payload: dict (event data), sender: peer ID
+    """
+    global current_event_id
+
+    event = {
+        "id": current_event_id,
+        "event_name": event_name,
+        "payload": payload,
+        "from": sender,
+        "timestamp": time.time()
+    }
+
+    current_event_id += 1
+    return event
