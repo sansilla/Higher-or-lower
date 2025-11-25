@@ -3,6 +3,33 @@ import threading
 import json
 import time
 
+# NEW: game logic imports + game state
+from events import (
+    make_event,
+    EVENT_GAME_START,
+    EVENT_DECK_COMMIT,
+    EVENT_DECK_REVEAL,
+    EVENT_TURN_START,
+    EVENT_GUESS,
+    EVENT_RESULT,
+    EVENT_TURN_END,
+    EVENT_PLAYER_JOIN,
+    EVENT_PLAYER_LEAVE,
+    EVENT_NEW_LEADER,
+)
+
+# === GAME STATE ===
+# NEW: shared game state for Higher/Lower
+event_log = []  # NEW: simple event log
+
+game_state = {  # NEW
+    "players": [],
+    "deck": None,
+    "current_card": None,
+    "current_turn": None,
+    "revealed_cards": [],
+}
+
 BOOTSTRAP_HOST = "127.0.0.1"
 BOOTSTRAP_PORT = 1234
 
@@ -148,9 +175,10 @@ def run_bully():
         leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
         print("[BULLY] I am the leader!")
+        start_game()  # NEW: leader starts the game after election
         return
 
-    # Notify higher-ID peers
+    # Notify higher-ID peers (original code restored)
     for pid in higher:
         try:
             send_ndjson(connections[pid], {"type": "ELECTION"})
@@ -164,6 +192,9 @@ def run_bully():
     if leader_id is None:
         leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
+        print("[BULLY] I am the leader (no OKs)!")
+        start_game()  # NEW: also start game in timeout case
+
 
 def broadcast(obj):
     """
@@ -174,6 +205,25 @@ def broadcast(obj):
             send_ndjson(conn, obj)
         except:
             pass
+
+
+def start_game():
+    """
+    Called by the leader to start the game.
+    For now: just broadcast the list of players.
+    """
+    # NEW: avoid duplicates and ensure we include ourselves
+    players = sorted(set(list(peers.keys()) + [my_id]))
+
+
+    event = make_event(
+        EVENT_GAME_START,
+        {"players": players},
+        sender=my_id,
+    )
+
+    print(f"[GAME] I am leader, starting game with players: {players}")
+    broadcast(event)  # NEW: broadcast GAME_START event to all peers
 
 
 # === RECEIVE MESSAGES FROM PEERS ===
@@ -220,19 +270,119 @@ def listen_to_peers():
 def handle_message(pid, msg):
     """
     Processes incoming peer messages:
-    - ELECTION → respond OK if our ID is higher
-    - LEADER → update leader_id
+    - Control messages (ELECTION, LEADER, OK)
+    - Game events (objects with 'event_name')
     """
     global leader_id
 
-    if msg["type"] == "ELECTION":
-        if my_id > pid:
-            # Send OK to lower-ID peer
-            send_ndjson(connections[pid], {"type": "OK", "from": my_id})
-    
-    elif msg["type"] == "LEADER":
-        leader_id = msg["leader"]
-        print(f"[BULLY] New leader elected: {leader_id}")
+    # Control messages for Bully algorithm
+    if "type" in msg:
+        if msg["type"] == "ELECTION":
+            if my_id > pid:
+                # Send OK to lower-ID peer
+                send_ndjson(connections[pid], {"type": "OK", "from": my_id})
+
+        elif msg["type"] == "LEADER":
+            leader_id = msg["leader"]
+            print(f"[BULLY] New leader elected: {leader_id}")
+
+        elif msg["type"] == "OK":
+            # Could track that a higher-id peer exists (not needed for now)
+            pass
+
+    # Game events
+    elif "event_name" in msg:  # NEW: pass game events into event handler
+        handle_event(msg)
+
+
+# NEW: event dispatcher + basic handlers
+
+def handle_event(event):  # NEW
+    """
+    Handle a game event coming from any peer.
+    """
+    event_name = event["event_name"]
+    payload = event["payload"]
+    sender = event["from"]
+
+    event_log.append(event)
+
+    if event_name == EVENT_GAME_START:
+        handle_game_start(payload, sender)
+    elif event_name == EVENT_DECK_COMMIT:
+        handle_deck_commit(payload, sender)
+    elif event_name == EVENT_DECK_REVEAL:
+        handle_deck_reveal(payload, sender)
+    elif event_name == EVENT_TURN_START:
+        handle_turn_start(payload, sender)
+    elif event_name == EVENT_GUESS:
+        handle_guess(payload, sender)
+    elif event_name == EVENT_RESULT:
+        handle_result(payload, sender)
+    elif event_name == EVENT_TURN_END:
+        handle_turn_end(payload, sender)
+    elif event_name == EVENT_PLAYER_JOIN:
+        handle_player_join(payload, sender)
+    elif event_name == EVENT_PLAYER_LEAVE:
+        handle_player_leave(payload, sender)
+    elif event_name == EVENT_NEW_LEADER:
+        handle_new_leader(payload, sender)
+
+
+def handle_game_start(payload, sender):  # NEW
+    players = payload.get("players", [])
+    game_state["players"] = players
+    print(f"[GAME] Game started by {sender}. Players: {players}")
+
+
+def handle_deck_commit(payload, sender):  # NEW
+    print(f"[GAME] Deck committed by {sender}")
+    game_state["deck"] = payload.get("deck")
+
+
+def handle_deck_reveal(payload, sender):  # NEW
+    card = payload.get("card")
+    print(f"[GAME] Card revealed: {card}")
+    game_state["current_card"] = card
+    game_state["revealed_cards"].append(card)
+
+
+def handle_turn_start(payload, sender):  # NEW
+    turn_player = payload.get("player")
+    print(f"[GAME] Turn start for player {turn_player}")
+    game_state["current_turn"] = turn_player
+
+
+def handle_guess(payload, sender):  # NEW
+    print(f"[GAME] Guess from {sender}: {payload}")
+
+
+def handle_result(payload, sender):  # NEW
+    print(f"[GAME] Result: {payload}")
+
+
+def handle_turn_end(payload, sender):  # NEW
+    print(f"[GAME] Turn ended: {payload}")
+
+
+def handle_player_join(payload, sender):  # NEW
+    pid = payload.get("player_id")
+    if pid is not None and pid not in game_state["players"]:
+        game_state["players"].append(pid)
+    print(f"[GAME] Player joined: {pid}")
+
+
+def handle_player_leave(payload, sender):  # NEW
+    pid = payload.get("player_id")
+    if pid in game_state["players"]:
+        game_state["players"].remove(pid)
+    print(f"[GAME] Player left: {pid}")
+
+
+def handle_new_leader(payload, sender):  # NEW
+    new_leader = payload.get("leader")
+    print(f"[GAME] New leader announced by {sender}: {new_leader}")
+
 
 threading.Thread(target=listen_to_peers, daemon=True).start()
 
