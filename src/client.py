@@ -13,15 +13,56 @@ bs.connect((BOOTSTRAP_HOST, BOOTSTRAP_PORT))
 
 bs.send(b"READY")  # Notify bootstrap server
 
+def recv_line(conn, buf):
+    """Read from connection (socket) until a newline byte is found, parse and return the line as decoded string
+    and return any remaining bytes.
+
+    Args:
+        conn: blocking object with recv(bytes) -> bytes
+        buf: bytes of previously received unprocessed data
+
+    Raises:
+        ConnectionError: if conn.recv() returns b"" indicating connection closed.
+
+    Returns:
+        (line_str, rest_bytes): line_str is the decoded bytes before the newline, 
+                rest_bytes are bytes after the newline to be stored for next reads.
+    """
+    while b"\n" not in buf:
+        data = conn.recv(4096)
+        if not data:
+            raise ConnectionError("socket closed")
+        buf += data
+
+    line, sep, rest = buf.partition(b"\n")
+    return line.decode(), rest
+
+def send_ndjson(conn, obj):
+    """
+    Serializes Python object as JSON, appends a newline and sends it.
+
+    Args:
+        conn: socket with sendall(bytes)
+        obj: JSON Python object
+    
+    Notes:
+    Uses newline-delimited JSON (NDJSON) message JSON + "\n". This blocks until all bytes are sent.
+    """
+    conn.sendall((json.dumps(obj) + "\n").encode())
+
 # Receive assigned ID
-my_id = json.loads(bs.recv(4096).decode())["your_id"]
+bs_buf = b""
+line, bs_buf = recv_line(bs, bs_buf)
+obj = json.loads(line)
+my_id = obj["your_id"]
 print(f"[CLIENT] My ID = {my_id}")
 
 # Data structures
 peers = {}         # peer_id -> (ip, port)
 connections = {}   # peer_id -> socket
 leader_id = None
-
+# with one receive buffer per connection we can handle each peer independently 
+recv_buffers = {} # conn -> bytes
 
 # === LISTEN FOR INCOMING PEER CONNECTIONS ===
 
@@ -39,6 +80,7 @@ def accept_peers():
     """
     while True:
         conn, addr = listener.accept()
+        recv_buffers[conn] = b""
         threading.Thread(
             target=handle_peer_connection, 
             args=(conn,),
@@ -49,13 +91,22 @@ def handle_peer_connection(conn):
     """
     Handles a new incoming peer connection.
     Reads peer ID and stores connection.
+    Adds receive buffer per connection.
     """
-    data = conn.recv(4096).decode()
-    msg = json.loads(data)
+    try:
+        line, rest = recv_line(conn, recv_buffers.get(conn, b""))
+    except ConnectionError:
+        return
+    
+    recv_buffers[conn] = rest
+    msg = json.loads(line)
     pid = msg["id"]
 
     connections[pid] = conn
     print(f"[P2P] Incoming connection from peer {pid}")
+
+    if leader_id is not None:
+        send_ndjson(conn, {"type": "LEADER", "leader": leader_id})
 
 threading.Thread(target=accept_peers, daemon=True).start()
 
@@ -73,7 +124,8 @@ def connect_to_peer(pid, ip, port):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((ip, port))
-        s.send(json.dumps({"id": my_id}).encode())
+        recv_buffers[s] = b""
+        send_ndjson(s, {"id": my_id})
         connections[pid] = s
         print(f"[P2P] Connected to peer {pid}")
     except:
@@ -81,6 +133,8 @@ def connect_to_peer(pid, ip, port):
 
 
 # === BULLY ELECTION ALGORITHM ===
+
+ok_received = threading.Event()
 
 def run_bully():
     """
@@ -93,6 +147,7 @@ def run_bully():
     print("[BULLY] Starting election.")
 
     higher = [pid for pid in peers if pid > my_id]
+    ok_received.clear()
 
     if not higher:
         # No higher peers → become leader
@@ -104,28 +159,39 @@ def run_bully():
     # Notify higher-ID peers
     for pid in higher:
         try:
-            connections[pid].send(json.dumps({"type": "ELECTION"}).encode())
+            send_ndjson(connections[pid], {"type": "ELECTION"})
         except:
             pass
 
     # Wait for OK responses
-    time.sleep(2)
+    ok_happened = ok_received.wait(timeout=2)
 
-    # If nobody responded, become leader
-    if leader_id is None:
+    if not ok_happened:
         leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
+        print("[BULLY] I am the leader!")
+    else:
+        print("[BULLY] OK received, waiting for LEADER broadcast")
+        start = time.time()
+        while leader_id is None:
+            time.sleep(0.1)
+            if time.time() - start > 3:
+                print("[BULLY] LEADER broadcast timeout → restarting election")
+                run_bully()
+                return
 
+    # If nobody responded, become leader
+    # if leader_id is None:
+    #     leader_id = my_id
+    #     broadcast({"type": "LEADER", "leader": my_id})
 
 def broadcast(obj):
     """
     Sends a message to all connected peers.
     """
-    msg = json.dumps(obj).encode()
-
     for pid, conn in connections.items():
         try:
-            conn.send(msg)
+            send_ndjson(conn, obj)
         except:
             pass
 
@@ -135,18 +201,84 @@ def broadcast(obj):
 def listen_to_peers():
     """
     Continuously listens for incoming messages from all connected peers.
+
+    Behavior:
+    - Iterates over global connections (mapping peer_id -> socket).
+    - Uses recv_buffers (mapping socket -> bytes) to combine partial reads.
+    - Temporarily sets the socket timeout to 0.01 to avoid blocking a long time on recv().
+    - Calls conn.recv(4096) and if a timeout occurs treats it as no data received
+    - appends any received bytes to the per-connection buffer.
+    - extracts complete lines (delimiter is "\n") from the buffer and 
+    decodes each line, parses JSON and calls handle_message for each parsed message.
+    - Stores any leftover partial bytes back into recv_buffers[conn] for the next iteration.
+    - Sleeps 0.1s after processing all connection and repeats indefinitely
     """
     while True:
         for pid, conn in list(connections.items()):
             try:
-                data = conn.recv(4096)
-                if not data:
-                    continue
-                msg = json.loads(data.decode())
-                handle_message(pid, msg)
-            except:
-                pass
+                buf = recv_buffers.get(conn, b"")
+                # read bytes without blocking too long
+                conn.settimeout(0.01)
+                try:
+                    data = conn.recv(4096)
+                except socket.timeout:
+                    data = b""
+                except (ConnectionResetError, BrokenPipeError):
+                    raise ConnectionError
+                finally:
+                    conn.settimeout(None)
+
+                if data:
+                    buf += data 
+                    # process full lines
+                    while b"\n"  in buf:
+                        line, sep, buf = buf.partition(b"\n")
+                        msg = json.loads(line.decode())
+                        last_seen[pid] = time.time()
+                        handle_message(pid, msg)
+                    recv_buffers[conn] = buf
+
+                if data == b"" and conn.fileno() == -1:
+                    raise ConnectionError
+                
+            except ConnectionError:
+                global leader_id
+                print(f"[P2P] Lost connection to peer {pid}")
+
+                # remove connection
+                try:
+                    conn.close()
+                except:
+                    pass
+
+                del connections[pid]
+                recv_buffers.pop(conn, None)
+
+                # remove recv buffer
+                recv_buffers.pop(conn, None)
+
+                # --- If the lost peer was the leader, start new election ---
+                global leader_id
+                if leader_id == pid:
+                    print("[BULLY] Leader disconnected → starting new election")
+                    leader_id = None
+                    threading.Thread(target=run_bully, daemon=True).start()
+
         time.sleep(0.1)
+
+last_seen = {}
+
+def heartbeat_monitor():
+    global leader_id
+    while True:
+        if leader_id and leader_id in last_seen:
+            if leader_id not in last_seen or time.time() - last_seen[leader_id] > 3:  # 3s timeout
+                print("[BULLY] Leader timeout → starting new election")
+                leader_id = None
+                threading.Thread(target=run_bully, daemon=True).start()
+        time.sleep(2)
+
+threading.Thread(target=heartbeat_monitor, daemon=True).start()
 
 def handle_message(pid, msg):
     """
@@ -159,12 +291,14 @@ def handle_message(pid, msg):
     if msg["type"] == "ELECTION":
         if my_id > pid:
             # Send OK to lower-ID peer
-            connections[pid].send(json.dumps({"type": "OK"}).encode())
-            run_bully()
-
+            send_ndjson(connections[pid], {"type": "OK", "from": my_id})
+    
     elif msg["type"] == "LEADER":
         leader_id = msg["leader"]
         print(f"[BULLY] New leader elected: {leader_id}")
+
+    elif msg["type"] == "OK":
+        ok_received.set()
 
 threading.Thread(target=listen_to_peers, daemon=True).start()
 
@@ -174,27 +308,34 @@ threading.Thread(target=listen_to_peers, daemon=True).start()
 print("[CLIENT] Waiting for peer list from bootstrap...")
 
 while True:
-    peer_packet = bs.recv(4096)
-    if not peer_packet:
+    try:
+        while b"\n" not in bs_buf:
+            data = bs.recv(4096)
+            if not data:
+                raise ConnectionError("bootstrap closed")
+            bs_buf += data
+
+        while b"\n" in bs_buf:
+            line, sep, bs_buf = bs_buf.partition(b"\n")
+            parsed = json.loads(line.decode())
+            new_list = parsed["peers"]
+
+            # Update peer list
+            for pid, (ip, port) in new_list:
+                peers[pid] = (ip, 50000 + pid)
+                if pid != my_id:
+                    connect_to_peer(pid, "127.0.0.1", 50000 + pid)
+
+            # Run initial election
+            if leader_id is None:
+                time.sleep(1)
+                run_bully()
+
+            # Re-elect if a stronger peer joins
+            elif any(pid > leader_id for pid in peers):
+                print("[BULLY] A stronger peer joined, re-running election.")
+                leader_id = None
+                time.sleep(0.5)
+                run_bully()
+    except ConnectionError:
         break
-
-    parsed = json.loads(peer_packet.decode())
-    new_list = parsed["peers"]
-
-    # Update peer list
-    for pid, (ip, port) in new_list:
-        peers[pid] = (ip, 50000 + pid)
-        if pid != my_id:
-            connect_to_peer(pid, "127.0.0.1", 50000 + pid)
-
-    # Run initial election
-    if leader_id is None:
-        time.sleep(1)
-        run_bully()
-
-    # Re-elect if a stronger peer joins
-    elif any(pid > leader_id for pid in peers):
-        print("[BULLY] A stronger peer joined, re-running election.")
-        leader_id = None
-        time.sleep(0.5)
-        run_bully()
