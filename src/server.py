@@ -23,21 +23,16 @@ def handle_client(conn, addr):
 
     print(f"[BOOTSTRAP] New connection from {addr}")
 
-    # assign ID
     cid = next_id
     next_id += 1
     client_ids[conn] = cid
 
-    # wait for "READY"
     conn.recv(16)
 
-    # send assigned ID
     send_ndjson(conn, {"your_id": cid})
 
-    # register client
     clients.append((cid, addr))
 
-    # send peer list to everyone
     peer_packet = {"peers": clients}
     for c in list(client_ids.keys()):
         try:
