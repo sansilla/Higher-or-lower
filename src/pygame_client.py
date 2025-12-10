@@ -2,6 +2,7 @@ import socket
 import json
 import random
 import threading
+import os
 
 import pygame
 
@@ -170,11 +171,63 @@ screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption(f"Higher or Lower - Player {my_id}")
 font = pygame.font.SysFont(None, 28)
 big_font = pygame.font.SysFont(None, 40)
+small_font = pygame.font.SysFont(None, 24)
 clock = pygame.time.Clock()
 
+# === CARD IMAGE LOADING ===
+
+CARD_IMAGES = {}  # (rank, suit) -> pygame.Surface
+
+BASE_DIR = os.path.dirname(__file__)
+CARD_IMAGE_DIR = os.path.join(BASE_DIR, "assets", "cards")
+
+
+def _card_filename(card):
+    """
+    card: (rank, suit) e.g. (1, 'H') or [1, 'H']
+    Returns filename like 'AH.png', '10H.png', etc.
+    """
+    if isinstance(card, list):
+        card = tuple(card)
+    rank, suit = card
+
+    rank_map = {1: "A", 11: "J", 12: "Q", 13: "K"}
+    r = rank_map.get(rank, str(rank))  # 2–10 stay numeric
+    return f"{r}{suit}.png"
+
+
+def get_card_image(card):
+    """
+    Returns a pygame.Surface for the given card, loading and caching if needed.
+    If image is missing, returns None.
+    """
+    if isinstance(card, list):
+        card = tuple(card)
+
+    key = card
+    if key in CARD_IMAGES:
+        return CARD_IMAGES[key]
+
+    filename = _card_filename(card)
+    path = os.path.join(CARD_IMAGE_DIR, filename)
+
+    if not os.path.exists(path):
+        print(f"[PYGAME] Card image not found: {path}")
+        return None
+
+    try:
+        img = pygame.image.load(path).convert_alpha()
+        img = pygame.transform.smoothscale(img, (200, 280))
+        CARD_IMAGES[key] = img
+        return img
+    except Exception as e:
+        print(f"[PYGAME] Failed to load card image {path}: {e}")
+        return None
+
+
 # Buttons
-button_higher = pygame.Rect(100, 320, 180, 60)
-button_lower = pygame.Rect(400, 320, 180, 60)
+button_higher = pygame.Rect(100, 360, 180, 60)
+button_lower = pygame.Rect(400, 360, 180, 60)
 
 
 def draw_text(text, x, y, fnt=None, color=(255, 255, 255)):
@@ -182,6 +235,15 @@ def draw_text(text, x, y, fnt=None, color=(255, 255, 255)):
         fnt = font
     img = fnt.render(text, True, color)
     screen.blit(img, (x, y))
+
+
+def draw_text_center(text, center_x, y, fnt=None, color=(255, 255, 255)):
+    if fnt is None:
+        fnt = font
+    img = fnt.render(text, True, color)
+    rect = img.get_rect()
+    rect.midtop = (center_x, y)
+    screen.blit(img, rect)
 
 
 def get_last_result():
@@ -224,20 +286,27 @@ while running:
     # === DRAW UI ===
     screen.fill((20, 20, 20))
 
-    # Leader info
+    # Top-left info
     leader = get_leader_id()
     draw_text(f"Your ID: {get_local_id()}", 20, 10)
     draw_text(f"Leader: {leader if leader is not None else 'None'}", 20, 40)
 
-    # Current card
+    # Card + turn text
     card = game_state.get("current_card")
+    card_rect = None
     if card is not None:
-        draw_text("Current card:", 20, 90)
-        draw_text(card_str(card), 180, 85, big_font)
-    else:
-        draw_text("Waiting for game to start...", 20, 90)
+        img = get_card_image(card)
+        if img is not None:
+            card_rect = img.get_rect()
+            card_rect.centerx = WIDTH // 2
+            card_rect.top = 70
+            screen.blit(img, card_rect)
+        else:
+            # Fallback text card (centered)
+            text = card_str(card)
+            draw_text_center(text, WIDTH // 2, 140, big_font)
 
-    # Turn info
+    # Turn info (centered above card)
     current_turn = game_state.get("current_turn")
     if current_turn is not None:
         if current_turn == get_local_id():
@@ -246,13 +315,15 @@ while running:
         else:
             turn_str = f"Turn: Player {current_turn}"
             color = (200, 200, 50)
-        draw_text(turn_str, 20, 130, big_font, color)
     else:
-        draw_text("No active turn.", 20, 130)
+        turn_str = "Waiting for game to start..."
+        color = (200, 200, 200)
 
-    # Last result
+    draw_text_center(turn_str, WIDTH // 2, 40, big_font, color)
+
+    # Last result: on the right side of the card
     last_res = get_last_result()
-    if last_res:
+    if last_res and card_rect is not None:
         player = last_res.get("player")
         correct = last_res.get("correct")
         prev = last_res.get("prev")
@@ -261,10 +332,16 @@ while running:
 
         prev_str = card_str(prev)
         new_str = card_str(new)
-        res_text = f"P{player} guessed {guess}: {'CORRECT' if correct else 'WRONG'} ({prev_str} → {new_str})"
-        color = (50, 220, 50) if correct else (220, 50, 50)
-        draw_text("Last result:", 20, 180)
-        draw_text(res_text, 20, 210, color=color)
+
+        base_x = card_rect.right + 20
+        base_y = card_rect.top + 20
+
+        result_color = (50, 220, 50) if correct else (220, 50, 50)
+
+        draw_text("Last result:", base_x, base_y, font)
+        draw_text(f"Player {player} guessed {guess}", base_x, base_y + 25, small_font, (200, 200, 200))
+        draw_text(f"{prev_str} -> {new_str}", base_x, base_y + 50, small_font, (220, 220, 220))
+        draw_text("CORRECT" if correct else "WRONG", base_x, base_y + 75, small_font, result_color)
 
     # Buttons
     is_my_turn = (game_state.get("current_turn") == get_local_id())
@@ -275,9 +352,6 @@ while running:
     pygame.draw.rect(screen, btn_color_l, button_lower)
     draw_text("HIGHER", button_higher.x + 40, button_higher.y + 18)
     draw_text("LOWER", button_lower.x + 45, button_lower.y + 18)
-
-    if not is_my_turn:
-        draw_text("You can only guess on YOUR turn.", 20, 260)
 
     pygame.display.flip()
     clock.tick(30)
