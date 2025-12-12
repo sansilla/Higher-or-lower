@@ -3,6 +3,8 @@ import threading
 import json
 import time
 
+from events import make_event, EVENT_PLAYER_LEAVE
+
 # === GLOBAL P2P STATE ===
 
 my_id = None  # set by init_p2p
@@ -16,7 +18,7 @@ ok_received = threading.Event()  # set when we receive OK to our ELECTION
 last_seen = {}                   # pid -> last time we saw any message from that peer
 
 HEARTBEAT_INTERVAL = 1.0   # seconds between heartbeats from leader
-LEADER_TIMEOUT = 30.0       # if no messages from leader in this many seconds → suspect failure
+LEADER_TIMEOUT = 30.0      # if no messages from leader in this many seconds → suspect failure
 
 _listener = None
 
@@ -81,10 +83,18 @@ def init_p2p(local_id: int, on_became_leader, on_new_leader, on_game_event):
 # === PUBLIC HELPERS ===
 
 def get_player_ids():
-    """
-    Return list of all known peer IDs plus ourselves.
-    """
+    """Return list of all known peer IDs plus ourselves."""
     return sorted(set(list(peers.keys()) + [my_id]))
+
+
+def get_local_id():
+    """Return this node's ID."""
+    return my_id
+
+
+def get_leader_id():
+    """Return current leader ID (or None if no leader elected yet)."""
+    return leader_id
 
 
 def broadcast(obj):
@@ -92,7 +102,6 @@ def broadcast(obj):
     Sends a JSON object to all connected peers.
     Also delivers game events locally via _on_game_event.
     """
-    # Send to peers over the network
     for pid, conn in list(connections.items()):
         try:
             send_ndjson(conn, obj)
@@ -102,7 +111,6 @@ def broadcast(obj):
     # Also handle our own game events locally
     if "event_name" in obj and _on_game_event:
         _on_game_event(obj)
-
 
 
 def connect_to_peer(pid: int, ip: str, port: int):
@@ -121,34 +129,65 @@ def connect_to_peer(pid: int, ip: str, port: int):
         connections[pid] = s
         print(f"[P2P] Connected to peer {pid}")
     except Exception:
-        # For now, silently ignore failures (peer may not be up yet)
         pass
+
+
+def _announce_player_left(pid: int):
+    """
+    Only the leader should announce player leave to the whole system.
+    This drives game_logic to remove player and skip turns if needed.
+    """
+    if leader_id == my_id:
+        ev = make_event(EVENT_PLAYER_LEAVE, {"player_id": pid}, sender=my_id)
+        broadcast(ev)
 
 
 def update_peers_from_bootstrap(new_list):
     """
-    Called by client when bootstrap server sends updated peer list.
-    - Updates peers dict
-    - Connects to new peers
-    - Triggers Bully election if needed
+    new_list: list of (pid, (ip, port)) coming from bootstrap
+    We add new peers AND remove peers that disappeared.
     """
     global leader_id
 
+    new_ids = set(pid for pid, _ in new_list)
+
+    # Remove peers that are no longer listed
+    stale = [pid for pid in list(peers.keys()) if pid not in new_ids]
+    for pid in stale:
+        print(f"[P2P] Peer {pid} removed by bootstrap list update")
+        peers.pop(pid, None)
+
+        conn = connections.pop(pid, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            recv_buffers.pop(conn, None)
+        last_seen.pop(pid, None)
+
+        # If leader removed -> reelect
+        if leader_id == pid:
+            leader_id = None
+            threading.Thread(target=run_bully, daemon=True).start()
+
+        # If we are leader, announce player leave to game layer
+        _announce_player_left(pid)
+
+    # Add/update peers and connect
     for pid, (ip, port) in new_list:
-        peers[pid] = (ip, 50000 + pid)  # still assume 50000+pid locally
+        peers[pid] = (ip, 50000 + pid)
         if pid != my_id:
             connect_to_peer(pid, "127.0.0.1", 50000 + pid)
 
-    # Run initial election
+    # Run election if needed
     if leader_id is None:
-        time.sleep(1)
+        time.sleep(0.5)
         run_bully()
-
-    # Re-elect if a stronger peer joins
     elif any(pid > leader_id for pid in peers):
         print("[BULLY] A stronger peer joined, re-running election.")
         leader_id = None
-        time.sleep(0.5)
+        time.sleep(0.2)
         run_bully()
 
 
@@ -167,23 +206,15 @@ def start_background_threads():
 # === INTERNAL: ACCEPT INCOMING PEERS ===
 
 def _accept_peers():
-    """
-    Accept incoming TCP connections from other peers.
-    """
+    """Accept incoming TCP connections from other peers."""
     while True:
         conn, addr = _listener.accept()
         recv_buffers[conn] = b""
-        threading.Thread(
-            target=_handle_peer_connection,
-            args=(conn,),
-            daemon=True
-        ).start()
+        threading.Thread(target=_handle_peer_connection, args=(conn,), daemon=True).start()
 
 
 def _handle_peer_connection(conn: socket.socket):
-    """
-    First message from incoming peer is their ID.
-    """
+    """First message from incoming peer is their ID."""
     try:
         line, rest = recv_line(conn, recv_buffers.get(conn, b""))
     except ConnectionError:
@@ -196,7 +227,6 @@ def _handle_peer_connection(conn: socket.socket):
     connections[pid] = conn
     print(f"[P2P] Incoming connection from peer {pid}")
 
-    # If we already know the leader, tell the new peer
     if leader_id is not None:
         send_ndjson(conn, {"type": "LEADER", "leader": leader_id})
 
@@ -216,7 +246,6 @@ def run_bully():
     higher = [pid for pid in peers if pid > my_id]
     ok_received.clear()
 
-    # If no higher-ID peers → I am the leader
     if not higher:
         leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
@@ -225,7 +254,6 @@ def run_bully():
             _on_became_leader()
         return
 
-    # Notify higher-ID peers
     for pid in higher:
         if pid in connections:
             try:
@@ -233,11 +261,9 @@ def run_bully():
             except Exception:
                 pass
 
-    # Wait for OK responses
     ok_happened = ok_received.wait(timeout=2)
 
     if not ok_happened:
-        # No OK → assume we are the highest active peer
         leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
         print("[BULLY] I am the leader! (no OK received)")
@@ -251,7 +277,6 @@ def run_bully():
             time.sleep(0.1)
             if time.time() - start > 3:
                 print("[BULLY] LEADER broadcast timeout → restarting election")
-                # Restart election from scratch
                 run_bully()
                 return
 
@@ -259,9 +284,7 @@ def run_bully():
 # === MESSAGE LOOP ===
 
 def _listen_to_peers():
-    """
-    Continuously listens for incoming messages from all connected peers.
-    """
+    """Continuously listens for incoming messages from all connected peers."""
     global leader_id
 
     while True:
@@ -280,16 +303,14 @@ def _listen_to_peers():
 
                 if data:
                     buf += data
-                    # process complete lines
                     while b"\n" in buf:
                         line, sep, buf = buf.partition(b"\n")
                         msg = json.loads(line.decode())
-                        # record last seen time for this peer
                         last_seen[pid] = time.time()
                         _handle_message(pid, msg)
                     recv_buffers[conn] = buf
 
-                # If connection is closed
+                # if socket looks dead
                 if data == b"" and conn.fileno() == -1:
                     raise ConnectionError
 
@@ -304,12 +325,16 @@ def _listen_to_peers():
                 connections.pop(pid, None)
                 recv_buffers.pop(conn, None)
                 last_seen.pop(pid, None)
+                peers.pop(pid, None)
 
-                # If the lost peer was the leader, start new election
+                # If lost peer was leader -> reelect
                 if leader_id == pid:
                     print("[BULLY] Leader disconnected → starting new election")
                     leader_id = None
                     threading.Thread(target=run_bully, daemon=True).start()
+
+                # If we are leader, announce leave
+                _announce_player_left(pid)
 
         time.sleep(0.1)
 
@@ -336,7 +361,6 @@ def _heartbeat_monitor():
     """
     global leader_id
     while True:
-        # Only followers (leader_id != my_id) should suspect leader failure
         if leader_id is not None and leader_id != my_id:
             if leader_id in last_seen:
                 if time.time() - last_seen[leader_id] > LEADER_TIMEOUT:
@@ -347,10 +371,7 @@ def _heartbeat_monitor():
 
 
 def _leader_heartbeat():
-    """
-    If we are the leader, periodically broadcast heartbeat messages so
-    followers know we are still alive.
-    """
+    """If we are the leader, periodically broadcast heartbeat messages."""
     while True:
         if leader_id == my_id:
             broadcast({"type": "HEARTBEAT", "from": my_id})
@@ -365,7 +386,7 @@ def _handle_bully_message(pid, msg):
     - ELECTION → respond OK if our ID is higher
     - LEADER   → update leader_id
     - OK       → mark that some higher peer is alive
-    - HEARTBEAT → liveness updates are handled in _listen_to_peers via last_seen
+    - HEARTBEAT → liveness updates handled by last_seen
     """
     global leader_id
 
@@ -373,14 +394,12 @@ def _handle_bully_message(pid, msg):
 
     if mtype == "ELECTION":
         if my_id > pid:
-            # Send OK to lower-ID peer
             if pid in connections:
                 send_ndjson(connections[pid], {"type": "OK", "from": my_id})
 
     elif mtype == "LEADER":
         leader_id = msg["leader"]
         print(f"[BULLY] New leader elected: {leader_id}")
-
         if _on_new_leader:
             _on_new_leader(leader_id, pid)
 
@@ -388,28 +407,4 @@ def _handle_bully_message(pid, msg):
         ok_received.set()
 
     elif mtype == "HEARTBEAT":
-        # Nothing special needed: _listen_to_peers already updated last_seen[pid]
         pass
-
-
-
-
-def get_player_ids():
-    """
-    Return list of all known peer IDs plus ourselves.
-    """
-    return sorted(set(list(peers.keys()) + [my_id]))
-
-
-def get_local_id():
-    """
-    Return this node's ID.
-    """
-    return my_id
-
-
-def get_leader_id():
-    """
-    Return current leader ID (or None if no leader elected yet).
-    """
-    return leader_id

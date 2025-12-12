@@ -22,7 +22,20 @@ from events import (
 from p2p import broadcast, get_local_id, get_leader_id
 
 
+# ------------------ DEDUP ------------------
+seen_events = set()  # (sender_id, event_id)
+
+
+def _dedup_key(event: dict):
+    return (event.get("from"), event.get("id"))
+
+
 def handle_event(event):
+    key = _dedup_key(event)
+    if key in seen_events:
+        return
+    seen_events.add(key)
+
     event_name = event["event_name"]
     payload = event["payload"]
     sender = event["from"]
@@ -91,7 +104,6 @@ def leader_handle_guess(payload, sender):
     idx = len(revealed)  # next card index in the deck
     if idx >= len(deck):
         print("[GAME] Deck exhausted, game over.")
-        # TODO: GAME_END event if you want
         return
 
     prev_card = game_state["current_card"]
@@ -131,7 +143,6 @@ def leader_handle_guess(payload, sender):
     )
     broadcast(result_event)
 
-    # End this turn
     end_event = make_event(
         EVENT_TURN_END,
         {"player": sender},
@@ -139,7 +150,7 @@ def leader_handle_guess(payload, sender):
     )
     broadcast(end_event)
 
-    # Start next turn (wrap around)
+    # Start next turn
     next_p = next_player_id()
     if next_p is None:
         print("[GAME] No next player, cannot continue turns.")
@@ -168,13 +179,19 @@ def handle_deck_commit(payload, sender):
     print(f"[GAME] Deck committed by {sender} with seed {seed}")
     game_state["deck"] = build_deck(seed)
     game_state["revealed_cards"] = []
+    game_state["current_card"] = None
 
 
 def handle_deck_reveal(payload, sender):
     card = payload.get("card")
-    print(f"[GAME] Card revealed: {card_str(card)}")
     if isinstance(card, list):
         card = tuple(card)
+
+    # Extra guard: avoid duplicate reveal of exact same card consecutively
+    if game_state["revealed_cards"] and game_state["revealed_cards"][-1] == card:
+        return
+
+    print(f"[GAME] Card revealed: {card_str(card)}")
     game_state["current_card"] = card
     game_state["revealed_cards"].append(card)
 
@@ -183,7 +200,6 @@ def handle_turn_start(payload, sender):
     turn_player = payload.get("player")
     print(f"[GAME] Turn start for player {turn_player}")
     game_state["current_turn"] = turn_player
-    # NOTE: no input() here anymore – GUI (or terminal UI) will send GUESS.
 
 
 def handle_guess(payload, sender):
@@ -215,14 +231,34 @@ def handle_player_join(payload, sender):
     pid = payload.get("player_id")
     if pid is not None and pid not in game_state["players"]:
         game_state["players"].append(pid)
+        game_state["players"] = sorted(game_state["players"])
     print(f"[GAME] Player joined: {pid}")
 
 
 def handle_player_leave(payload, sender):
+    """
+    Remove player from turn order.
+    If it was their turn, leader must advance the turn and broadcast TURN_START.
+    """
     pid = payload.get("player_id")
+    if pid is None:
+        return
+
     if pid in game_state["players"]:
         game_state["players"].remove(pid)
+
     print(f"[GAME] Player left: {pid}")
+
+    # If leaving player had the turn, leader advances immediately
+    local_id = get_local_id()
+    if get_leader_id() == local_id and game_state.get("current_turn") == pid:
+        nxt = next_player_id()
+        if nxt is not None:
+            game_state["current_turn"] = nxt
+            turn_event = make_event(EVENT_TURN_START, {"player": nxt}, sender=local_id)
+            broadcast(turn_event)
+        else:
+            game_state["current_turn"] = None
 
 
 def handle_new_leader(payload, sender):
