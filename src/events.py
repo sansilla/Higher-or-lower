@@ -1,7 +1,7 @@
 import time
 
 EVENT_GAME_START = "GAME_START"
-EVENT_DECK_COMMIT = "DECK_COMMIT"  # lock the order of the deck
+EVENT_DECK_COMMIT = "DECK_COMMIT"
 EVENT_DECK_REVEAL = "DECK_REVEAL"
 
 EVENT_TURN_START = "TURN_START"
@@ -13,13 +13,16 @@ EVENT_PLAYER_JOIN = "PLAYER_JOIN"
 EVENT_PLAYER_LEAVE = "PLAYER_LEAVE"
 EVENT_NEW_LEADER = "NEW_LEADER"
 
+# === RECONNECTION / SYNC ===
+EVENT_STATE_REQUEST = "STATE_REQUEST"
+EVENT_STATE_SNAPSHOT = "STATE_SNAPSHOT"
+
 current_event_id = 0
 
 
 def make_event(event_name, payload, sender):
     """
-    Constructs a standard event. event_name: str (e.g. TURN_START),
-    payload: dict (event data), sender: peer ID
+    Constructs a standard event.
     """
     global current_event_id
 

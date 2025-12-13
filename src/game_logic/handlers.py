@@ -1,8 +1,3 @@
-"""
-Game event dispatcher and handlers.
-This module ONLY handles interpreting game events and driving game turns.
-"""
-
 from .state import game_state, event_log
 from .cards import build_deck, card_str
 from events import (
@@ -17,16 +12,18 @@ from events import (
     EVENT_PLAYER_JOIN,
     EVENT_PLAYER_LEAVE,
     EVENT_NEW_LEADER,
+    EVENT_STATE_REQUEST,
+    EVENT_STATE_SNAPSHOT,
 )
 
-from p2p import broadcast, get_local_id, get_leader_id
+from p2p import broadcast, send_to, get_local_id, get_leader_id, get_player_ids
 
 
 # ------------------ DEDUP ------------------
-seen_events = set()  # (sender_id, event_id)
+seen_events = set()
 
 
-def _dedup_key(event: dict):
+def _dedup_key(event):
     return (event.get("from"), event.get("id"))
 
 
@@ -36,231 +33,198 @@ def handle_event(event):
         return
     seen_events.add(key)
 
-    event_name = event["event_name"]
+    event_log.append(event)
+
+    name = event["event_name"]
     payload = event["payload"]
     sender = event["from"]
 
-    event_log.append(event)
-
-    if event_name == EVENT_GAME_START:
-        handle_game_start(payload, sender)
-    elif event_name == EVENT_DECK_COMMIT:
-        handle_deck_commit(payload, sender)
-    elif event_name == EVENT_DECK_REVEAL:
-        handle_deck_reveal(payload, sender)
-    elif event_name == EVENT_TURN_START:
-        handle_turn_start(payload, sender)
-    elif event_name == EVENT_GUESS:
+    if name == EVENT_GAME_START:
+        handle_game_start(payload)
+    elif name == EVENT_DECK_COMMIT:
+        handle_deck_commit(payload)
+    elif name == EVENT_DECK_REVEAL:
+        handle_deck_reveal(payload)
+    elif name == EVENT_TURN_START:
+        handle_turn_start(payload)
+    elif name == EVENT_GUESS:
         handle_guess(payload, sender)
-    elif event_name == EVENT_RESULT:
-        handle_result(payload, sender)
-    elif event_name == EVENT_TURN_END:
-        handle_turn_end(payload, sender)
-    elif event_name == EVENT_PLAYER_JOIN:
-        handle_player_join(payload, sender)
-    elif event_name == EVENT_PLAYER_LEAVE:
-        handle_player_leave(payload, sender)
-    elif event_name == EVENT_NEW_LEADER:
-        handle_new_leader(payload, sender)
+    elif name == EVENT_RESULT:
+        pass
+    elif name == EVENT_TURN_END:
+        pass
+    elif name == EVENT_PLAYER_JOIN:
+        handle_player_join(payload)
+    elif name == EVENT_PLAYER_LEAVE:
+        handle_player_leave(payload)
+    elif name == EVENT_NEW_LEADER:
+        handle_new_leader()
+    elif name == EVENT_STATE_REQUEST:
+        handle_state_request(sender)
+    elif name == EVENT_STATE_SNAPSHOT:
+        handle_state_snapshot(payload)
+
+
+# ================= LEADER-ONLY HELPERS =================
+
+def _leader_only():
+    return get_local_id() == get_leader_id()
+
+
+def _leader_reconcile_membership():
+    """Leader-only: players list must match alive P2P peers."""
+    if not _leader_only():
+        return
+
+    alive = set(get_player_ids())
+    players = set(game_state.get("players", []))
+
+    for pid in players - alive:
+        game_state["players"].remove(pid)
+        broadcast(make_event(EVENT_PLAYER_LEAVE, {"player_id": pid}, sender=get_local_id()))
+
+    for pid in alive - players:
+        game_state["players"].append(pid)
+        broadcast(make_event(EVENT_PLAYER_JOIN, {"player_id": pid}, sender=get_local_id()))
+
+    game_state["players"].sort()
+
+
+def _leader_advance_turn(from_pid):
+    """Leader-only deterministic successor."""
+    players = game_state.get("players", [])
+    if not players:
+        game_state["current_turn"] = None
+        return
+
+    if from_pid not in players:
+        nxt = players[0]
     else:
-        print(f"[GAME] Unknown event {event_name} from {sender}")
+        i = players.index(from_pid)
+        nxt = players[(i + 1) % len(players)]
+
+    game_state["current_turn"] = nxt
+    broadcast(make_event(EVENT_TURN_START, {"player": nxt}, sender=get_local_id()))
 
 
-# === TURN / LEADER HELPERS ===
+# ================= EVENT HANDLERS =================
 
-def next_player_id():
-    """
-    Return the ID of the next player in turn order (wraps around).
-    """
-    players = game_state["players"]
-    current = game_state["current_turn"]
-    if not players or current not in players:
-        return None
-    idx = players.index(current)
-    return players[(idx + 1) % len(players)]
+def handle_game_start(payload):
+    game_state["players"] = sorted(payload["players"])
 
 
-def leader_handle_guess(payload, sender):
-    """
-    Called on the leader when it receives a GUESS event from the current player.
-    Evaluates guess, reveals next card, sends RESULT + TURN_END + next TURN_START.
-    """
-    local_id = get_local_id()
-    leader_id = get_leader_id()
-
-    if leader_id != local_id:
-        return  # only leader evaluates
-
-    if sender != game_state["current_turn"]:
-        print(f"[CHEAT?] Player {sender} sent GUESS outside their turn")
-        return
-
-    deck = game_state["deck"]
-    revealed = game_state["revealed_cards"]
-    if deck is None:
-        print("[GAME] No deck available on leader.")
-        return
-
-    idx = len(revealed)  # next card index in the deck
-    if idx >= len(deck):
-        print("[GAME] Deck exhausted, game over.")
-        return
-
-    prev_card = game_state["current_card"]
-    next_card = deck[idx]
-
-    # Reveal next card
-    game_state["current_card"] = next_card
-    game_state["revealed_cards"].append(next_card)
-
-    reveal_event = make_event(
-        EVENT_DECK_REVEAL,
-        {"card": next_card},
-        sender=local_id,
-    )
-    broadcast(reveal_event)
-
-    # Evaluate guess
-    guess_val = payload.get("guess")
-    prev_rank = prev_card[0]
-    next_rank = next_card[0]
-
-    correct = (
-        (next_rank > prev_rank and guess_val == "HIGHER")
-        or (next_rank < prev_rank and guess_val == "LOWER")
-    )
-
-    result_event = make_event(
-        EVENT_RESULT,
-        {
-            "player": sender,
-            "correct": correct,
-            "prev": prev_card,
-            "new": next_card,
-            "guess": guess_val,
-        },
-        sender=local_id,
-    )
-    broadcast(result_event)
-
-    end_event = make_event(
-        EVENT_TURN_END,
-        {"player": sender},
-        sender=local_id,
-    )
-    broadcast(end_event)
-
-    # Start next turn
-    next_p = next_player_id()
-    if next_p is None:
-        print("[GAME] No next player, cannot continue turns.")
-        return
-
-    game_state["current_turn"] = next_p
-
-    turn_event = make_event(
-        EVENT_TURN_START,
-        {"player": next_p},
-        sender=local_id,
-    )
-    broadcast(turn_event)
-
-
-# === PER-EVENT HANDLERS ===
-
-def handle_game_start(payload, sender):
-    players = payload.get("players", [])
-    game_state["players"] = players
-    print(f"[GAME] Game started by {sender}. Players: {players}")
-
-
-def handle_deck_commit(payload, sender):
-    seed = payload.get("seed")
-    print(f"[GAME] Deck committed by {sender} with seed {seed}")
+def handle_deck_commit(payload):
+    seed = payload["seed"]
+    game_state["deck_seed"] = seed
     game_state["deck"] = build_deck(seed)
     game_state["revealed_cards"] = []
     game_state["current_card"] = None
 
 
-def handle_deck_reveal(payload, sender):
-    card = payload.get("card")
-    if isinstance(card, list):
-        card = tuple(card)
-
-    # Extra guard: avoid duplicate reveal of exact same card consecutively
+def handle_deck_reveal(payload):
+    card = tuple(payload["card"])
     if game_state["revealed_cards"] and game_state["revealed_cards"][-1] == card:
         return
-
     print(f"[GAME] Card revealed: {card_str(card)}")
-    game_state["current_card"] = card
     game_state["revealed_cards"].append(card)
+    game_state["current_card"] = card
 
 
-def handle_turn_start(payload, sender):
-    turn_player = payload.get("player")
-    print(f"[GAME] Turn start for player {turn_player}")
-    game_state["current_turn"] = turn_player
+def handle_turn_start(payload):
+    # FOLLOWERS ONLY APPLY — NEVER FIX
+    game_state["current_turn"] = payload["player"]
+    print(f"[GAME] Turn start for player {payload['player']}")
 
 
 def handle_guess(payload, sender):
-    print(f"[GAME] Guess from {sender}: {payload}")
-    leader_handle_guess(payload, sender)
-
-
-def handle_result(payload, sender):
-    player = payload.get("player")
-    correct = payload.get("correct")
-    prev = payload.get("prev")
-    new = payload.get("new")
-    guess = payload.get("guess")
-
-    prev_str = card_str(prev)
-    new_str = card_str(new)
-
-    if correct:
-        print(f"[GAME] Player {player} guessed {guess} correctly! {prev_str} -> {new_str}")
-    else:
-        print(f"[GAME] Player {player} guessed {guess} wrong. {prev_str} -> {new_str}")
-
-
-def handle_turn_end(payload, sender):
-    print(f"[GAME] Turn ended: {payload}")
-
-
-def handle_player_join(payload, sender):
-    pid = payload.get("player_id")
-    if pid is not None and pid not in game_state["players"]:
-        game_state["players"].append(pid)
-        game_state["players"] = sorted(game_state["players"])
-    print(f"[GAME] Player joined: {pid}")
-
-
-def handle_player_leave(payload, sender):
-    """
-    Remove player from turn order.
-    If it was their turn, leader must advance the turn and broadcast TURN_START.
-    """
-    pid = payload.get("player_id")
-    if pid is None:
+    if not _leader_only():
         return
 
+    if sender != game_state.get("current_turn"):
+        return
+
+    _leader_reconcile_membership()
+
+    deck = game_state["deck"]
+    idx = len(game_state["revealed_cards"])
+    if idx >= len(deck):
+        return
+
+    prev = game_state["current_card"]
+    next_card = deck[idx]
+
+    game_state["revealed_cards"].append(next_card)
+    game_state["current_card"] = next_card
+
+    broadcast(make_event(EVENT_DECK_REVEAL, {"card": next_card}, sender=get_local_id()))
+
+    correct = (
+        (next_card[0] > prev[0] and payload["guess"] == "HIGHER") or
+        (next_card[0] < prev[0] and payload["guess"] == "LOWER")
+    )
+
+    broadcast(make_event(
+        EVENT_RESULT,
+        {"player": sender, "correct": correct, "prev": prev, "new": next_card, "guess": payload["guess"]},
+        sender=get_local_id()
+    ))
+
+    _leader_advance_turn(sender)
+
+
+def handle_player_join(payload):
+    pid = payload["player_id"]
+    if pid not in game_state["players"]:
+        game_state["players"].append(pid)
+        game_state["players"].sort()
+
+
+def handle_player_leave(payload):
+    pid = payload["player_id"]
     if pid in game_state["players"]:
         game_state["players"].remove(pid)
 
-    print(f"[GAME] Player left: {pid}")
-
-    # If leaving player had the turn, leader advances immediately
-    local_id = get_local_id()
-    if get_leader_id() == local_id and game_state.get("current_turn") == pid:
-        nxt = next_player_id()
-        if nxt is not None:
-            game_state["current_turn"] = nxt
-            turn_event = make_event(EVENT_TURN_START, {"player": nxt}, sender=local_id)
-            broadcast(turn_event)
-        else:
-            game_state["current_turn"] = None
+    if _leader_only() and game_state.get("current_turn") == pid:
+        _leader_advance_turn(pid)
 
 
-def handle_new_leader(payload, sender):
-    new_leader = payload.get("leader")
-    print(f"[GAME] New leader announced by {sender}: {new_leader}")
+def handle_new_leader():
+    if not _leader_only():
+        return
+
+    _leader_reconcile_membership()
+
+    if game_state.get("current_turn") not in game_state.get("players", []):
+        _leader_advance_turn(game_state["players"][0])
+
+
+# ================= SNAPSHOT =================
+
+def handle_state_request(sender):
+    if not _leader_only():
+        return
+
+    _leader_reconcile_membership()
+
+    snap = {
+        "players": list(game_state["players"]),
+        "deck_seed": game_state["deck_seed"],
+        "revealed_n": len(game_state["revealed_cards"]),
+        "current_turn": game_state["current_turn"],
+        "current_card": game_state["current_card"],
+    }
+
+    send_to(sender, make_event(EVENT_STATE_SNAPSHOT, {"snapshot": snap}, sender=get_local_id()))
+
+
+def handle_state_snapshot(payload):
+    snap = payload["snapshot"]
+
+    game_state["players"] = list(snap["players"])
+    game_state["deck_seed"] = snap["deck_seed"]
+    game_state["deck"] = build_deck(snap["deck_seed"])
+    game_state["revealed_cards"] = game_state["deck"][:snap["revealed_n"]]
+    game_state["current_card"] = snap["current_card"]
+    game_state["current_turn"] = snap["current_turn"]
+
+    # 🚨 FOLLOWERS DO NOT FIX TURNS

@@ -7,61 +7,48 @@ from events import make_event, EVENT_PLAYER_LEAVE
 
 # === GLOBAL P2P STATE ===
 
-my_id = None  # set by init_p2p
+my_id = None
 
 peers = {}          # peer_id -> (ip, port)
 connections = {}    # peer_id -> socket
-recv_buffers = {}   # socket -> bytes (partial data buffer)
-leader_id = None    # current leader
+recv_buffers = {}   # socket -> bytes
+leader_id = None
 
-ok_received = threading.Event()  # set when we receive OK to our ELECTION
-last_seen = {}                   # pid -> last time we saw any message from that peer
+ok_received = threading.Event()
+last_seen = {}
 
-HEARTBEAT_INTERVAL = 1.0   # seconds between heartbeats from leader
-LEADER_TIMEOUT = 30.0      # if no messages from leader in this many seconds → suspect failure
+HEARTBEAT_INTERVAL = 1.0
+LEADER_TIMEOUT = 30.0
 
 _listener = None
 
-# callbacks provided by client
-_on_became_leader = None     # () -> None
-_on_new_leader = None        # (leader_id: int, sender: int) -> None
-_on_game_event = None        # (event_dict: dict) -> None
+_on_became_leader = None
+_on_new_leader = None
+_on_game_event = None
+
+# ✅ One lock to protect shared P2P state across threads
+_state_lock = threading.Lock()
 
 
-# === NDJSON UTILITIES (also used by client for bootstrap) ===
+# === NDJSON UTILITIES ===
 
 def recv_line(conn, buf: bytes):
-    """
-    Read from connection until a newline byte is found.
-    Return (decoded_line, remaining_bytes).
-    """
     while b"\n" not in buf:
         data = conn.recv(4096)
         if not data:
             raise ConnectionError("socket closed")
         buf += data
-
-    line, sep, rest = buf.partition(b"\n")
+    line, _, rest = buf.partition(b"\n")
     return line.decode(), rest
 
 
 def send_ndjson(conn, obj):
-    """
-    Serializes Python object as JSON, appends a newline and sends it.
-    Uses newline-delimited JSON (NDJSON): JSON + "\n".
-    """
     conn.sendall((json.dumps(obj) + "\n").encode())
 
 
-# === INITIALIZATION ===
+# === INIT ===
 
 def init_p2p(local_id: int, on_became_leader, on_new_leader, on_game_event):
-    """
-    Initialize P2P layer for this client.
-    - Sets my_id
-    - Stores callbacks
-    - Creates listener socket and starts accept_peers thread
-    """
     global my_id, _listener, _on_became_leader, _on_new_leader, _on_game_event
 
     my_id = local_id
@@ -76,275 +63,347 @@ def init_p2p(local_id: int, on_became_leader, on_new_leader, on_game_event):
     _listener.listen()
 
     print(f"[CLIENT] Listening for peers on port {listen_port}")
-
     threading.Thread(target=_accept_peers, daemon=True).start()
 
 
 # === PUBLIC HELPERS ===
 
 def get_player_ids():
-    """Return list of all known peer IDs plus ourselves."""
-    return sorted(set(list(peers.keys()) + [my_id]))
+    with _state_lock:
+        return sorted(set(list(peers.keys()) + [my_id]))
 
 
 def get_local_id():
-    """Return this node's ID."""
     return my_id
 
 
 def get_leader_id():
-    """Return current leader ID (or None if no leader elected yet)."""
-    return leader_id
+    with _state_lock:
+        return leader_id
 
 
 def broadcast(obj):
-    """
-    Sends a JSON object to all connected peers.
-    Also delivers game events locally via _on_game_event.
-    """
-    for pid, conn in list(connections.items()):
+    # send to peers
+    with _state_lock:
+        items = list(connections.items())
+
+    for pid, conn in items:
         try:
             send_ndjson(conn, obj)
         except Exception:
             pass
 
-    # Also handle our own game events locally
+    # deliver locally
     if "event_name" in obj and _on_game_event:
         _on_game_event(obj)
 
 
+def send_to(pid: int, obj):
+    """
+    Direct send to a single peer (used for snapshot responses).
+    """
+    with _state_lock:
+        conn = connections.get(pid)
+    if not conn:
+        return False
+    try:
+        send_ndjson(conn, obj)
+        return True
+    except Exception:
+        return False
+
+
 def connect_to_peer(pid: int, ip: str, port: int):
-    """
-    Connects to another peer if not already connected.
-    Sends own ID upon connecting.
-    """
-    if pid in connections:
-        return
+    with _state_lock:
+        if pid in connections:
+            return
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect((ip, port))
-        recv_buffers[s] = b""
+        with _state_lock:
+            recv_buffers[s] = b""
+            connections[pid] = s
         send_ndjson(s, {"id": my_id})
-        connections[pid] = s
         print(f"[P2P] Connected to peer {pid}")
     except Exception:
-        pass
+        try:
+            s.close()
+        except Exception:
+            pass
 
 
 def _announce_player_left(pid: int):
     """
-    Only the leader should announce player leave to the whole system.
-    This drives game_logic to remove player and skip turns if needed.
+    Only the current leader should broadcast PLAYER_LEAVE (single source of truth).
     """
-    if leader_id == my_id:
+    with _state_lock:
+        is_leader = (leader_id == my_id)
+    if is_leader:
         ev = make_event(EVENT_PLAYER_LEAVE, {"player_id": pid}, sender=my_id)
         broadcast(ev)
 
 
 def update_peers_from_bootstrap(new_list):
     """
-    new_list: list of (pid, (ip, port)) coming from bootstrap
-    We add new peers AND remove peers that disappeared.
+    Bootstrap is membership oracle in your current architecture.
+    new_list is: [(pid, (ip, port)), ...]
     """
     global leader_id
 
     new_ids = set(pid for pid, _ in new_list)
 
-    # Remove peers that are no longer listed
-    stale = [pid for pid in list(peers.keys()) if pid not in new_ids]
-    for pid in stale:
-        print(f"[P2P] Peer {pid} removed by bootstrap list update")
-        peers.pop(pid, None)
+    # Remove stale peers
+    with _state_lock:
+        stale = [pid for pid in list(peers.keys()) if pid not in new_ids]
 
-        conn = connections.pop(pid, None)
+    for pid in stale:
+        print(f"[P2P] Peer {pid} removed by bootstrap update")
+
+        with _state_lock:
+            peers.pop(pid, None)
+
+            conn = connections.pop(pid, None)
+            if conn is not None:
+                recv_buffers.pop(conn, None)
+            last_seen.pop(pid, None)
+
+            was_leader = (leader_id == pid)
+            if was_leader:
+                leader_id = None
+
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
-            recv_buffers.pop(conn, None)
-        last_seen.pop(pid, None)
 
-        # If leader removed -> reelect
-        if leader_id == pid:
-            leader_id = None
+        if was_leader:
             threading.Thread(target=run_bully, daemon=True).start()
 
-        # If we are leader, announce player leave to game layer
         _announce_player_left(pid)
 
     # Add/update peers and connect
     for pid, (ip, port) in new_list:
-        peers[pid] = (ip, 50000 + pid)
+        with _state_lock:
+            peers[pid] = (ip, 50000 + pid)
+
         if pid != my_id:
             connect_to_peer(pid, "127.0.0.1", 50000 + pid)
 
-    # Run election if needed
-    if leader_id is None:
-        time.sleep(0.5)
-        run_bully()
-    elif any(pid > leader_id for pid in peers):
-        print("[BULLY] A stronger peer joined, re-running election.")
-        leader_id = None
-        time.sleep(0.2)
+    # Election logic: if we don't know a leader yet, wait briefly
+    with _state_lock:
+        need_election = (leader_id is None)
+
+    if need_election:
+        start = time.time()
+        while True:
+            with _state_lock:
+                if leader_id is not None:
+                    return
+            if time.time() - start >= 1.5:
+                break
+            time.sleep(0.05)
+
+        print("[BULLY] No leader announcement received -> starting election.")
         run_bully()
 
 
 def start_background_threads():
-    """
-    Start the P2P background threads:
-    - listen_to_peers
-    - heartbeat_monitor
-    - leader_heartbeat
-    """
     threading.Thread(target=_listen_to_peers, daemon=True).start()
     threading.Thread(target=_heartbeat_monitor, daemon=True).start()
     threading.Thread(target=_leader_heartbeat, daemon=True).start()
 
 
-# === INTERNAL: ACCEPT INCOMING PEERS ===
+# === INCOMING CONNECTIONS ===
 
 def _accept_peers():
-    """Accept incoming TCP connections from other peers."""
     while True:
         conn, addr = _listener.accept()
-        recv_buffers[conn] = b""
+        with _state_lock:
+            recv_buffers[conn] = b""
         threading.Thread(target=_handle_peer_connection, args=(conn,), daemon=True).start()
 
 
 def _handle_peer_connection(conn: socket.socket):
-    """First message from incoming peer is their ID."""
     try:
-        line, rest = recv_line(conn, recv_buffers.get(conn, b""))
+        with _state_lock:
+            buf0 = recv_buffers.get(conn, b"")
+        line, rest = recv_line(conn, buf0)
     except ConnectionError:
+        try:
+            conn.close()
+        except Exception:
+            pass
         return
 
-    recv_buffers[conn] = rest
+    with _state_lock:
+        recv_buffers[conn] = rest
+
     msg = json.loads(line)
     pid = msg["id"]
 
-    connections[pid] = conn
+    with _state_lock:
+        connections[pid] = conn
+        current_leader = leader_id
+
     print(f"[P2P] Incoming connection from peer {pid}")
 
-    if leader_id is not None:
-        send_ndjson(conn, {"type": "LEADER", "leader": leader_id})
+    # Tell new peer who leader is (if known)
+    if current_leader is not None:
+        try:
+            send_ndjson(conn, {"type": "LEADER", "leader": current_leader})
+        except Exception:
+            pass
 
 
-# === BULLY ELECTION ALGORITHM ===
+# === BULLY ===
 
 def run_bully():
-    """
-    Runs the Bully Election Algorithm:
-    - Sends ELECTION messages to all peers with higher IDs
-    - If no OK is received after timeout, becomes leader
-    - Otherwise waits for a LEADER broadcast (with timeout)
-    """
     global leader_id
     print("[BULLY] Starting election.")
 
-    higher = [pid for pid in peers if pid > my_id]
-    ok_received.clear()
+    with _state_lock:
+        higher = [pid for pid in peers if pid > my_id]
+        ok_received.clear()
 
     if not higher:
-        leader_id = my_id
+        with _state_lock:
+            leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
         print("[BULLY] I am the leader! (no higher peers)")
         if _on_became_leader:
             _on_became_leader()
         return
 
-    for pid in higher:
-        if pid in connections:
+    with _state_lock:
+        conns_snapshot = {pid: connections.get(pid) for pid in higher}
+
+    for pid, conn in conns_snapshot.items():
+        if conn:
             try:
-                send_ndjson(connections[pid], {"type": "ELECTION"})
+                send_ndjson(conn, {"type": "ELECTION"})
             except Exception:
                 pass
 
     ok_happened = ok_received.wait(timeout=2)
 
     if not ok_happened:
-        leader_id = my_id
+        with _state_lock:
+            leader_id = my_id
         broadcast({"type": "LEADER", "leader": my_id})
         print("[BULLY] I am the leader! (no OK received)")
         if _on_became_leader:
             _on_became_leader()
         return
-    else:
-        print("[BULLY] OK received, waiting for LEADER broadcast")
-        start = time.time()
-        while leader_id is None:
-            time.sleep(0.1)
-            if time.time() - start > 3:
-                print("[BULLY] LEADER broadcast timeout → restarting election")
-                run_bully()
+
+    print("[BULLY] OK received, waiting for LEADER broadcast")
+    start = time.time()
+    while True:
+        with _state_lock:
+            if leader_id is not None:
                 return
+        if time.time() - start > 3:
+            print("[BULLY] LEADER broadcast timeout -> restarting election")
+            run_bully()
+            return
+        time.sleep(0.1)
 
 
 # === MESSAGE LOOP ===
 
-def _listen_to_peers():
-    """Continuously listens for incoming messages from all connected peers."""
+def _close_and_remove_peer(pid: int, conn: socket.socket, *, may_trigger_election: bool):
     global leader_id
 
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+    with _state_lock:
+        # Only remove if still mapped to this conn (avoid races)
+        if connections.get(pid) is conn:
+            connections.pop(pid, None)
+        recv_buffers.pop(conn, None)
+        last_seen.pop(pid, None)
+        peers.pop(pid, None)
+
+        was_leader = (leader_id == pid)
+        if was_leader:
+            leader_id = None
+
+    if was_leader and may_trigger_election:
+        print("[BULLY] Leader disconnected -> starting new election")
+        threading.Thread(target=run_bully, daemon=True).start()
+
+    _announce_player_left(pid)
+
+
+def _listen_to_peers():
     while True:
-        for pid, conn in list(connections.items()):
+        with _state_lock:
+            items = list(connections.items())
+
+        for pid, conn in items:
+            # If socket already closed, treat as disconnect
             try:
-                buf = recv_buffers.get(conn, b"")
-                conn.settimeout(0.01)
+                if conn.fileno() < 0:
+                    raise ConnectionError
+            except Exception:
+                _close_and_remove_peer(pid, conn, may_trigger_election=True)
+                continue
+
+            try:
+                with _state_lock:
+                    buf = recv_buffers.get(conn, b"")
+
+                # Small non-blocking poll
+                try:
+                    conn.settimeout(0.01)
+                except OSError:
+                    raise ConnectionError
+
                 try:
                     data = conn.recv(4096)
                 except socket.timeout:
                     data = b""
-                except (ConnectionResetError, BrokenPipeError):
+                except (ConnectionResetError, BrokenPipeError, OSError):
                     raise ConnectionError
                 finally:
-                    conn.settimeout(None)
+                    try:
+                        conn.settimeout(None)
+                    except OSError:
+                        # If it got closed right here, treat as disconnect next iteration
+                        pass
 
                 if data:
                     buf += data
                     while b"\n" in buf:
-                        line, sep, buf = buf.partition(b"\n")
+                        line, _, buf = buf.partition(b"\n")
                         msg = json.loads(line.decode())
-                        last_seen[pid] = time.time()
-                        _handle_message(pid, msg)
-                    recv_buffers[conn] = buf
 
-                # if socket looks dead
-                if data == b"" and conn.fileno() == -1:
-                    raise ConnectionError
+                        with _state_lock:
+                            last_seen[pid] = time.time()
+
+                        _handle_message(pid, msg)
+
+                    with _state_lock:
+                        recv_buffers[conn] = buf
+
+                # If peer closed socket cleanly
+                if data == b"":
+                    # no data may mean "timeout" OR "closed"; check fileno again
+                    if conn.fileno() < 0:
+                        raise ConnectionError
 
             except ConnectionError:
                 print(f"[P2P] Lost connection to peer {pid}")
-
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-                connections.pop(pid, None)
-                recv_buffers.pop(conn, None)
-                last_seen.pop(pid, None)
-                peers.pop(pid, None)
-
-                # If lost peer was leader -> reelect
-                if leader_id == pid:
-                    print("[BULLY] Leader disconnected → starting new election")
-                    leader_id = None
-                    threading.Thread(target=run_bully, daemon=True).start()
-
-                # If we are leader, announce leave
-                _announce_player_left(pid)
+                _close_and_remove_peer(pid, conn, may_trigger_election=True)
 
         time.sleep(0.1)
 
 
 def _handle_message(pid, msg):
-    """
-    Processes incoming peer messages:
-    - Control messages (have 'type' field)
-    - Game events (have 'event_name' field)
-    """
     if "type" in msg:
         _handle_bully_message(pid, msg)
     elif "event_name" in msg:
@@ -352,53 +411,54 @@ def _handle_message(pid, msg):
             _on_game_event(msg)
 
 
-# === HEARTBEAT THREADS ===
+# === HEARTBEATS ===
 
 def _heartbeat_monitor():
-    """
-    Followers monitor leader liveness based on last_seen timestamps.
-    If the leader is silent for too long, they trigger a new election.
-    """
     global leader_id
     while True:
-        if leader_id is not None and leader_id != my_id:
-            if leader_id in last_seen:
-                if time.time() - last_seen[leader_id] > LEADER_TIMEOUT:
-                    print("[BULLY] Leader timeout → starting new election")
+        with _state_lock:
+            lid = leader_id
+            lid_last = last_seen.get(lid) if lid is not None else None
+
+        if lid is not None and lid != my_id and lid_last is not None:
+            if time.time() - lid_last > LEADER_TIMEOUT:
+                print("[BULLY] Leader timeout -> starting new election")
+                with _state_lock:
                     leader_id = None
-                    threading.Thread(target=run_bully, daemon=True).start()
+                threading.Thread(target=run_bully, daemon=True).start()
+
         time.sleep(2)
 
 
 def _leader_heartbeat():
-    """If we are the leader, periodically broadcast heartbeat messages."""
     while True:
-        if leader_id == my_id:
+        with _state_lock:
+            is_leader = (leader_id == my_id)
+        if is_leader:
             broadcast({"type": "HEARTBEAT", "from": my_id})
         time.sleep(HEARTBEAT_INTERVAL)
 
 
-# === BULLY CONTROL MESSAGE HANDLING ===
+# === BULLY CONTROL ===
 
 def _handle_bully_message(pid, msg):
-    """
-    Processes Bully control messages:
-    - ELECTION → respond OK if our ID is higher
-    - LEADER   → update leader_id
-    - OK       → mark that some higher peer is alive
-    - HEARTBEAT → liveness updates handled by last_seen
-    """
     global leader_id
-
     mtype = msg.get("type")
 
     if mtype == "ELECTION":
         if my_id > pid:
-            if pid in connections:
-                send_ndjson(connections[pid], {"type": "OK", "from": my_id})
+            with _state_lock:
+                conn = connections.get(pid)
+            if conn:
+                try:
+                    send_ndjson(conn, {"type": "OK", "from": my_id})
+                except Exception:
+                    pass
+        threading.Thread(target=run_bully, daemon=True).start()
 
     elif mtype == "LEADER":
-        leader_id = msg["leader"]
+        with _state_lock:
+            leader_id = msg["leader"]
         print(f"[BULLY] New leader elected: {leader_id}")
         if _on_new_leader:
             _on_new_leader(leader_id, pid)

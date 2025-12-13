@@ -12,61 +12,114 @@ server.listen()
 
 print(f"[BOOTSTRAP] Listening on {LISTEN_IP}:{LISTEN_PORT}")
 
-clients = []          # list of (cid, addr)
-client_ids = {}       # conn -> cid
+clients = []            # [(cid, addr)]
+client_ids = {}         # conn -> cid
 next_id = 1
 lock = threading.Lock()
+
+token_to_id = {}        # token -> cid
+id_to_username = {}     # cid -> username
+
 
 def send_ndjson(conn, obj):
     conn.sendall((json.dumps(obj) + "\n").encode())
 
-def broadcast_peers():
+
+def broadcast_membership():
     with lock:
-        peer_packet = {"peers": list(clients)}
+        packet = {
+            "peers": list(clients),              # KEEP OLD FORMAT: [(id, addr), ...]
+            "usernames": dict(id_to_username),   # NEW FIELD
+        }
         conns = list(client_ids.keys())
+
     for c in conns:
         try:
-            send_ndjson(c, peer_packet)
+            send_ndjson(c, packet)
         except Exception:
             pass
 
-def handle_client(conn, addr):
-    global next_id
-    print(f"[BOOTSTRAP] New connection from {addr}")
 
-    with lock:
-        cid = next_id
-        next_id += 1
-        client_ids[conn] = cid
+def recv_line(conn, buf: bytes):
+    while b"\n" not in buf:
+        data = conn.recv(4096)
+        if not data:
+            raise ConnectionError
+        buf += data
+    line, _, rest = buf.partition(b"\n")
+    return line.decode(), rest
+
+
+def handle_client(conn, addr):
+    global next_id, clients
+
+    print(f"[BOOTSTRAP] New connection from {addr}")
+    buf = b""
+    cid = None
 
     try:
-        conn.recv(16)  # expect READY
-        send_ndjson(conn, {"your_id": cid})
+        line, buf = recv_line(conn, buf)
+        line = line.strip()
+
+        # Accept BOTH:
+        #   old client: "READY"
+        #   new client: {"type":"READY","token":"...","username":"..."}
+        token = None
+        username = None
+
+        if line == "READY":
+            pass
+        else:
+            msg = json.loads(line)
+            if msg.get("type") == "READY":
+                token = msg.get("token")
+                username = msg.get("username")
 
         with lock:
+            if token and token in token_to_id:
+                cid = token_to_id[token]
+            else:
+                cid = next_id
+                next_id += 1
+                if token:
+                    token_to_id[token] = cid
+
+            if not username:
+                username = f"p{cid}"
+            id_to_username[cid] = username
+
+            client_ids[conn] = cid
+
+            # reconnect-safe: replace any existing entry for cid
+            clients[:] = [(i, a) for (i, a) in clients if i != cid]
             clients.append((cid, addr))
 
-        broadcast_peers()
+        send_ndjson(conn, {"your_id": cid})
+        broadcast_membership()
 
-        # Keep connection open; detect disconnect
+        # keep alive
         while True:
             data = conn.recv(1)
             if not data:
-                raise ConnectionError("client disconnected")
+                raise ConnectionError
 
     except Exception:
         print(f"[BOOTSTRAP] Client {cid} disconnected")
 
     finally:
         with lock:
-            # remove from structures
             client_ids.pop(conn, None)
             clients[:] = [(i, a) for (i, a) in clients if i != cid]
+            if cid is not None:
+                id_to_username.pop(cid, None)
+
         try:
             conn.close()
         except Exception:
             pass
-        broadcast_peers()
+
+        broadcast_membership()
+
 
 while True:
     conn, addr = server.accept()

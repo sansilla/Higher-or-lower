@@ -23,8 +23,8 @@ You can test the connection by running the following commands in separate termin
 python3 server.py
 ```
 
-**other terminals (clients):**
+**other terminals (clients). Instead of "username" insert your username:**
 
 ```bash
-python3 pygame_client.py
+python3 pygame_client.py "username"
 ```
