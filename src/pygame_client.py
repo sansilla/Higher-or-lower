@@ -5,6 +5,7 @@ import threading
 import os
 import sys
 import uuid
+import time
 
 import pygame
 
@@ -69,6 +70,103 @@ def display_name(pid: int | None) -> str:
     return u if u else f"p{pid}"
 
 
+# ================= PERSISTENT EVENT LOG (JSONL) =================
+
+LOGS_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+_log_fp = None
+
+
+def init_persistent_event_log(node_id: int):
+    global _log_fp
+    path = os.path.join(LOGS_DIR, f"node_{node_id}.jsonl")
+    _log_fp = open(path, "a", encoding="utf-8")
+    _log_fp.write(json.dumps({"ts": time.time(), "event_name": "LOG_OPEN", "payload": {"node": node_id}}) + "\n")
+    _log_fp.flush()
+
+
+def log_to_disk(ev: dict):
+    if _log_fp is None:
+        return
+    if "ts" not in ev:
+        ev = dict(ev)
+        ev["ts"] = time.time()
+    _log_fp.write(json.dumps(ev) + "\n")
+    _log_fp.flush()
+
+
+# ================= SNAPSHOT SYNC (FIXES "WAITING UNTIL NEXT TURN") =================
+# Problem you described: reconnect shows "Waiting..." until someone plays a turn.
+# That happens when snapshot isn't received/applied immediately (or event name mismatch).
+#
+# Fixes here:
+# 1) Robust snapshot detection (don’t rely only on event_name string).
+# 2) While waiting for snapshot, we buffer ONLY turn-affecting events.
+# 3) We re-send STATE_REQUEST periodically until we actually have deck/state.
+# 4) When snapshot arrives we FORCE a full pile replay animation (all old cards fall).
+
+syncing_from_snapshot = False
+deferred_turn_events = []
+
+TURN_AFFECTING_EVENTS = {EVENT_TURN_START, EVENT_RESULT, EVENT_GUESS}
+
+# triggers in UI thread to replay pile animation
+force_replay_reveals = False
+
+# resend STATE_REQUEST if still missing state
+requested_snapshot = False
+last_snapshot_request_ts = 0.0
+SNAPSHOT_RESEND_EVERY = 1.0  # seconds
+
+
+def _is_snapshot_event(ev: dict) -> bool:
+    """
+    Robust detection:
+    - event_name matches common snapshot name(s), OR
+    - payload looks like a snapshot (has deck_seed + revealed_n or revealed_cards)
+    """
+    name = ev.get("event_name")
+    if name in ("STATE_SNAPSHOT", "EVENT_STATE_SNAPSHOT", "STATE_SYNC", "SNAPSHOT"):
+        return True
+    payload = ev.get("payload") or {}
+    if isinstance(payload, dict):
+        if "deck_seed" in payload and ("revealed_n" in payload or "revealed_cards" in payload):
+            return True
+        if "current_turn" in payload and ("deck_seed" in payload or "deck" in payload):
+            return True
+    return False
+
+
+def handle_event_persistent(ev: dict):
+    global syncing_from_snapshot, deferred_turn_events, force_replay_reveals
+    global requested_snapshot, last_snapshot_request_ts
+
+    log_to_disk(ev)
+    ev_name = ev.get("event_name")
+
+    # Buffer turn-affecting events while syncing so stale TURN_START/RESULT/GUESS
+    # can’t overwrite the snapshot's current_turn.
+    if syncing_from_snapshot and ev_name in TURN_AFFECTING_EVENTS:
+        deferred_turn_events.append(ev)
+        return
+
+    # Snapshot arrived -> apply it, then drop buffered turn events, then force replay
+    if _is_snapshot_event(ev):
+        handle_event(ev)  # apply snapshot to game_state
+
+        syncing_from_snapshot = False
+        deferred_turn_events.clear()
+
+        requested_snapshot = False
+        last_snapshot_request_ts = 0.0
+
+        force_replay_reveals = True
+        return
+
+    # Normal processing
+    handle_event(ev)
+
+
 # ================= P2P CALLBACKS =================
 
 def on_became_leader():
@@ -91,7 +189,7 @@ def on_became_leader():
 
 
 def on_new_leader(leader_id, sender):
-    handle_event(make_event(EVENT_NEW_LEADER, {"leader": leader_id}, sender=sender))
+    handle_event_persistent(make_event(EVENT_NEW_LEADER, {"leader": leader_id}, sender=sender))
 
 
 # ================= BOOTSTRAP =================
@@ -99,18 +197,19 @@ def on_new_leader(leader_id, sender):
 bs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 bs.connect((BOOTSTRAP_HOST, BOOTSTRAP_PORT))
 
-# Send READY with token + username (server also supports plain "READY")
 bs.sendall((json.dumps({"type": "READY", "token": token, "username": username}) + "\n").encode())
 
 bs_buf = b""
 line, bs_buf = recv_line(bs, bs_buf)
 my_id = json.loads(line)["your_id"]
 
+init_persistent_event_log(my_id)
+
 init_p2p(
     local_id=my_id,
     on_became_leader=on_became_leader,
     on_new_leader=on_new_leader,
-    on_game_event=handle_event,
+    on_game_event=handle_event_persistent,
 )
 start_background_threads()
 
@@ -131,11 +230,9 @@ def bootstrap_loop():
                     continue
                 msg = json.loads(raw.decode())
 
-                # peers stays old shape: [(id, addr), ...]
                 if "peers" in msg:
                     update_peers_from_bootstrap(msg["peers"])
 
-                # usernames is optional; normalize keys to int
                 um = msg.get("usernames")
                 if isinstance(um, dict):
                     usernames_map = {int(k): v for k, v in um.items()}
@@ -143,7 +240,6 @@ def bootstrap_loop():
         except ConnectionError:
             break
         except Exception:
-            # never kill the whole UI because of a bad membership line
             continue
 
 
@@ -160,8 +256,6 @@ pygame.display.set_caption(f"Higher or Lower - {username} (ID {my_id})")
 font = pygame.font.SysFont(None, 28)
 big_font = pygame.font.SysFont(None, 40)
 small_font = pygame.font.SysFont(None, 24)
-
-# bigger username label (top-left)
 username_font = pygame.font.SysFont(None, 50)
 
 clock = pygame.time.Clock()
@@ -215,11 +309,7 @@ BTN_LOWER = pygame.transform.smoothscale(
 
 
 def make_disabled(surface: pygame.Surface) -> pygame.Surface:
-    """
-    Darken the PNG itself (preserve rounded alpha), so no black rectangle outline.
-    """
     s = surface.copy()
-    # darker, close to background tone
     s.fill((95, 95, 95, 255), special_flags=pygame.BLEND_RGBA_MULT)
     return s
 
@@ -234,7 +324,13 @@ PILE_MAX = 6
 PILE_DX = 6
 PILE_DY = 5
 PILE_ANGLE = 2
+
+# Normal animation speed
 ANIM_TIME = 0.25
+
+# Catch-up speed when reconnecting (lots of queued reveals)
+CATCHUP_ANIM_TIME = 0.05
+CATCHUP_THRESHOLD = 8  # if pending_reveals > this, use fast speed
 
 anim = {"active": False}
 seen_reveals = 0
@@ -277,11 +373,14 @@ def get_last_result():
 
 # ================= SNAPSHOT REQUEST (RECONNECT SYNC) =================
 
-requested_snapshot = False
+def _need_snapshot() -> bool:
+    # you used this before: deck is None means we're not synced yet
+    return game_state.get("deck") is None
 
 
 def maybe_request_snapshot():
-    global requested_snapshot
+    global requested_snapshot, syncing_from_snapshot, deferred_turn_events, last_snapshot_request_ts
+
     leader = get_leader_id()
     local = get_local_id()
 
@@ -289,13 +388,22 @@ def maybe_request_snapshot():
         return
     if leader == local:
         return
-    if requested_snapshot:
-        return
-    if game_state.get("deck") is not None:
+    if not _need_snapshot():
         return
 
-    requested_snapshot = True
-    broadcast(make_event(EVENT_STATE_REQUEST, {}, sender=local))
+    now = time.time()
+
+    # First time: start syncing
+    if not requested_snapshot:
+        requested_snapshot = True
+        syncing_from_snapshot = True
+        deferred_turn_events.clear()
+        last_snapshot_request_ts = 0.0
+
+    # Re-send request periodically until we actually receive snapshot
+    if (now - last_snapshot_request_ts) >= SNAPSHOT_RESEND_EVERY:
+        last_snapshot_request_ts = now
+        broadcast(make_event(EVENT_STATE_REQUEST, {}, sender=local))
 
 
 def maybe_start_game_if_leader():
@@ -336,7 +444,7 @@ while running:
     draw_text(f"Your ID: {get_local_id()}", 20, 56)
     draw_text(f"Leader: {get_leader_id()}", 20, 80)
 
-    # Turn text: <username>'s turn (real names when known)
+    # Turn text
     turn = game_state.get("current_turn")
     if turn is not None:
         draw_text_center(f"{display_name(turn)}'s turn", 40, color=(200, 200, 50))
@@ -346,22 +454,39 @@ while running:
     # --- Reveal queue update ---
     revealed_all = game_state.get("revealed_cards", [])
 
+    # If snapshot just arrived, force a full replay animation of the pile.
+    if force_replay_reveals:
+        pending_reveals.clear()
+        pending_reveals.extend(revealed_all)  # animate ALL old cards falling
+        seen_reveals = len(revealed_all)
+        anim = {"active": False}
+        # key: start from "nothing finished" so it visibly builds up
+        # (finished_count is computed below from pending_reveals)
+        force_replay_reveals = False
+
+    # Handle rewind/restart
     if len(revealed_all) < seen_reveals:
         seen_reveals = len(revealed_all)
         pending_reveals.clear()
         anim = {"active": False}
 
+    # Normal case: queue only new reveals
     if len(revealed_all) > seen_reveals:
         pending_reveals.extend(revealed_all[seen_reveals:])
         seen_reveals = len(revealed_all)
 
     now = pygame.time.get_ticks() / 1000.0
 
+    # Decide speed: if we have a big backlog (typical after reconnect), animate faster
+    use_fast = len(pending_reveals) > CATCHUP_THRESHOLD
+    anim_time_current = CATCHUP_ANIM_TIME if use_fast else ANIM_TIME
+
+    # Start next falling card
     if (not anim["active"]) and pending_reveals:
         next_card = pending_reveals.pop(0)
 
-        finished_count = seen_reveals - len(pending_reveals) - 1
-        top_index = min(finished_count, PILE_MAX - 1)
+        finished_count_for_position = seen_reveals - len(pending_reveals) - 1
+        top_index = min(finished_count_for_position, PILE_MAX - 1)
 
         tx, ty, ta = pile_pose(top_index)
         anim = {
@@ -372,8 +497,10 @@ while running:
             "to": (tx, ty),
             "from_a": -15,
             "to_a": ta,
+            "dur": anim_time_current,
         }
 
+    # Draw finished pile (your original logic)
     started_not_finished = 1 if anim["active"] else 0
     finished_count = seen_reveals - len(pending_reveals) - started_not_finished
     if finished_count < 0:
@@ -389,8 +516,10 @@ while running:
         x, y, a = pile_pose(i)
         screen.blit(pygame.transform.rotozoom(img, a, 1), (x, y))
 
+    # Draw falling card
     if anim["active"]:
-        t = min((now - anim["t0"]) / ANIM_TIME, 1.0)
+        dur = anim.get("dur", ANIM_TIME)
+        t = min((now - anim["t0"]) / dur, 1.0)
         t_smooth = t * t * (3 - 2 * t)
 
         x = lerp(anim["from"][0], anim["to"][0], t_smooth)
@@ -425,7 +554,7 @@ while running:
             y = margin + i * line_h
             screen.blit(img, (x, y))
 
-    # Buttons: use darkened PNG when inactive (no outline)
+    # Buttons
     is_my_turn = (game_state.get("current_turn") == get_local_id())
 
     if is_my_turn:
@@ -443,3 +572,12 @@ while running:
     clock.tick(60)
 
 pygame.quit()
+
+# close log on exit (optional)
+try:
+    if _log_fp is not None:
+        _log_fp.write(json.dumps({"ts": time.time(), "event_name": "LOG_CLOSE", "payload": {"node": my_id}}) + "\n")
+        _log_fp.flush()
+        _log_fp.close()
+except Exception:
+    pass

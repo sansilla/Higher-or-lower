@@ -35,6 +35,13 @@ def handle_event(event):
 
     event_log.append(event)
 
+    from .persistent_log import log_event
+    log_event(event)
+
+
+
+
+
     name = event["event_name"]
     payload = event["payload"]
     sender = event["from"]
