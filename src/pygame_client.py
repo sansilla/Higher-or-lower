@@ -34,7 +34,7 @@ from p2p import (
     get_leader_id,
 )
 
-BOOTSTRAP_HOST = "127.0.0.1"
+BOOTSTRAP_HOST = "192.168.1.34"
 BOOTSTRAP_PORT = 1234
 
 BASE_DIR = os.path.dirname(__file__)
