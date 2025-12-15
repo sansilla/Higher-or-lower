@@ -32,3 +32,8 @@ python3 pygame_client.py "username"
 
 IMPORTANT!!!
 If running on multiple devices, set BOOTSTRAP_HOST in pygame_client.py to the server machine’s LAN IP.
+
+
+Notes
+The bootstrap server IP is not included in this repository for privacy reasons and must be configured manually before running the project.
+AI-assisted tools (GitHub Copilot, ChatGPT) were used during development for debugging support, code prediction/suggestions of Copilot, and code refactoring to make it more readable. All system design, architecture, and functionality were designed and implemented by the authors.

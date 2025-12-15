@@ -34,7 +34,7 @@ from p2p import (
     get_leader_id,
 )
 
-BOOTSTRAP_HOST = "192.168.1.33"
+BOOTSTRAP_HOST = "127.0.0.1"
 BOOTSTRAP_PORT = 1234
 
 BASE_DIR = os.path.dirname(__file__)
@@ -153,7 +153,7 @@ def handle_event_persistent(ev: dict):
         deferred_turn_events.append(ev)
         return
 
-    # is snapshot came drop buffered turn events
+    # if snapshot came drop buffered turn events
     if _is_snapshot_event(ev):
         handle_event(ev)
 

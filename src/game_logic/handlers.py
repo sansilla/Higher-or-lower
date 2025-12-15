@@ -1,5 +1,6 @@
 from .state import game_state, event_log
 from .cards import build_deck, card_str
+from .persistent_log import log_event
 from events import (
     make_event,
     EVENT_GAME_START,
@@ -35,7 +36,7 @@ def handle_event(event):
 
     event_log.append(event)
 
-    from .persistent_log import log_event
+    
     log_event(event)
 
 
@@ -78,8 +79,11 @@ def _leader_only():
     return get_local_id() == get_leader_id()
 
 
+
 def _leader_reconcile_membership():
-    """Leader-only: players list must match alive P2P peers."""
+    
+    
+
     if not _leader_only():
         return
 
@@ -101,11 +105,17 @@ def _leader_reconcile_membership():
 
 
 def _leader_advance_turn(from_pid):
-    """Leader-only deterministic successor."""
+    
+    
+
+
+
     players = game_state.get("players", [])
     if not players:
         game_state["current_turn"] = None
         return
+
+
 
     if from_pid not in players:
         nxt = players[0]
@@ -128,6 +138,8 @@ def handle_game_start(payload):
 
 def handle_deck_commit(payload):
     seed = payload["seed"]
+
+    
     game_state["deck_seed"] = seed
     game_state["deck"] = build_deck(seed)
     game_state["revealed_cards"] = []
