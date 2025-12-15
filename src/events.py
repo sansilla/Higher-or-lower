@@ -13,7 +13,11 @@ EVENT_PLAYER_JOIN = "PLAYER_JOIN"
 EVENT_PLAYER_LEAVE = "PLAYER_LEAVE"
 EVENT_NEW_LEADER = "NEW_LEADER"
 
-# === RECONNECTION / SYNC ===
+#
+
+
+
+#reconnection
 EVENT_STATE_REQUEST = "STATE_REQUEST"
 EVENT_STATE_SNAPSHOT = "STATE_SNAPSHOT"
 
@@ -21,9 +25,7 @@ current_event_id = 0
 
 
 def make_event(event_name, payload, sender):
-    """
-    Constructs a standard event.
-    """
+
     global current_event_id
 
     event = {
@@ -33,6 +35,7 @@ def make_event(event_name, payload, sender):
         "from": sender,
         "timestamp": time.time(),
     }
+
 
     current_event_id += 1
     return event

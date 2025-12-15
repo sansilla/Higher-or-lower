@@ -5,13 +5,16 @@ import time
 
 from events import make_event, EVENT_PLAYER_LEAVE
 
-# === GLOBAL P2P STATE ===
+
+
+
+#global p2p state
 
 my_id = None
 
-peers = {}          # peer_id -> (ip, port)
-connections = {}    # peer_id -> socket
-recv_buffers = {}   # socket -> bytes
+peers = {} 
+connections = {} 
+recv_buffers = {}
 leader_id = None
 
 ok_received = threading.Event()
@@ -29,6 +32,8 @@ _on_game_event = None
 _state_lock = threading.Lock()
 
 
+
+
 def recv_line(conn, buf: bytes):
     while b"\n" not in buf:
         data = conn.recv(4096)
@@ -39,8 +44,12 @@ def recv_line(conn, buf: bytes):
     return line.decode(), rest
 
 
+
+
 def send_ndjson(conn, obj):
     conn.sendall((json.dumps(obj) + "\n").encode())
+
+
 
 
 def init_p2p(local_id: int, on_became_leader, on_new_leader, on_game_event):
@@ -114,6 +123,9 @@ def connect_to_peer(pid: int, ip: str, port: int):
             connections[pid] = s
         send_ndjson(s, {"id": my_id})
         print(f"[P2P] Connected to peer {pid} at {ip}:{port}")
+
+
+
     except Exception:
         try:
             s.close()
@@ -130,17 +142,20 @@ def _announce_player_left(pid: int):
 
 
 def update_peers_from_bootstrap(new_list):
-    """
-    new_list is: [(pid, (ip, port)), ...]
-    Bootstrap provides the REAL reachable IP/port for each peer.
-    """
     global leader_id
 
     new_ids = set(pid for pid, _ in new_list)
 
+
+
+
+
+
     # Remove stale peers
     with _state_lock:
         stale = [pid for pid in list(peers.keys()) if pid not in new_ids]
+
+
 
     for pid in stale:
         print(f"[P2P] Peer {pid} removed by bootstrap update")
@@ -168,7 +183,9 @@ def update_peers_from_bootstrap(new_list):
 
         _announce_player_left(pid)
 
-    # ✅ IMPORTANT FIX: use ip/port from bootstrap (NOT 127.0.0.1)
+  
+    
+
     for pid, (ip, port) in new_list:
         with _state_lock:
             peers[pid] = (ip, port)
@@ -176,7 +193,9 @@ def update_peers_from_bootstrap(new_list):
         if pid != my_id:
             connect_to_peer(pid, ip, port)
 
-    # Election logic: if we don't know a leader yet, wait briefly
+   
+   
+
     with _state_lock:
         need_election = (leader_id is None)
 
@@ -192,6 +211,9 @@ def update_peers_from_bootstrap(new_list):
 
         print("[BULLY] No leader announcement received -> starting election.")
         run_bully()
+
+
+
 
 
 def start_background_threads():
@@ -272,6 +294,7 @@ def _handle_bully_message(pid, msg):
             last_seen[pid] = time.time()
 
 
+
 def run_bully():
     global leader_id
     print("[BULLY] Starting election.")
@@ -290,6 +313,9 @@ def run_bully():
             _on_became_leader()
         return
 
+
+
+
     with _state_lock:
         conns_snapshot = {pid: connections.get(pid) for pid in higher}
 
@@ -299,6 +325,9 @@ def run_bully():
                 send_ndjson(conn, {"type": "ELECTION"})
             except Exception:
                 pass
+
+
+
 
     ok_happened = ok_received.wait(timeout=2)
 
@@ -312,6 +341,8 @@ def run_bully():
             _on_became_leader()
         return
 
+
+
     print("[BULLY] OK received, waiting for LEADER broadcast")
     start = time.time()
     while True:
@@ -323,6 +354,10 @@ def run_bully():
             run_bully()
             return
         time.sleep(0.1)
+
+
+
+
 
 
 def _close_and_remove_peer(pid: int, conn: socket.socket, *, may_trigger_election: bool):
@@ -349,6 +384,10 @@ def _close_and_remove_peer(pid: int, conn: socket.socket, *, may_trigger_electio
         threading.Thread(target=run_bully, daemon=True).start()
 
     _announce_player_left(pid)
+
+
+
+
 
 
 def _listen_to_peers():

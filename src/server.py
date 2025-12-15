@@ -12,13 +12,13 @@ server.listen()
 
 print(f"[BOOTSTRAP] Listening on {LISTEN_IP}:{LISTEN_PORT}")
 
-clients = []            # [(cid, (ip, p2p_port))]
-client_ids = {}         # conn -> cid
+clients = []
+client_ids = {}
 next_id = 1
 lock = threading.Lock()
 
-token_to_id = {}        # token -> cid
-id_to_username = {}     # cid -> username
+token_to_id = {}
+id_to_username = {}
 
 
 def send_ndjson(conn, obj):
@@ -28,7 +28,7 @@ def send_ndjson(conn, obj):
 def broadcast_membership():
     with lock:
         packet = {
-            "peers": list(clients),              # [(id, (ip, port)), ...]
+            "peers": list(clients),
             "usernames": dict(id_to_username),
         }
         print("[BOOTSTRAP] peers broadcast:", packet["peers"])
@@ -65,9 +65,6 @@ def handle_client(conn, addr):
         token = None
         username = None
 
-        # Accept BOTH:
-        #   old client: "READY"
-        #   new client: {"type":"READY","token":"...","username":"..."}
         if line == "READY":
             pass
         else:
@@ -77,7 +74,7 @@ def handle_client(conn, addr):
                 username = msg.get("username")
 
         with lock:
-            # Reuse ID on reconnect (token)
+      
             if token and token in token_to_id:
                 cid = token_to_id[token]
             else:
@@ -92,20 +89,20 @@ def handle_client(conn, addr):
 
             client_ids[conn] = cid
 
-            # ✅ IMPORTANT FIX:
-            # P2P listener port is deterministic: 50000 + cid
-            # addr[1] is EPHEMERAL bootstrap client port -> do NOT use it
+
+
+
             p2p_port = 50000 + cid
             peer_addr = (addr[0], p2p_port)
 
-            # reconnect-safe: replace any existing entry for cid
+        
             clients[:] = [(i, a) for (i, a) in clients if i != cid]
             clients.append((cid, peer_addr))
 
         send_ndjson(conn, {"your_id": cid})
         broadcast_membership()
 
-        # keep alive
+
         while True:
             data = conn.recv(1)
             if not data:
@@ -127,6 +124,9 @@ def handle_client(conn, addr):
             pass
 
         broadcast_membership()
+
+
+
 
 
 while True:

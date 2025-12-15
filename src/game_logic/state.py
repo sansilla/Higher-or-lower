@@ -1,9 +1,5 @@
-"""
-Shared game state and event log for the Higher/Lower game.
-This is imported by client.py and handlers.py.
-"""
 
-event_log = []  # list of events
+event_log = []  #events
 
 game_state = {
     "players": [],

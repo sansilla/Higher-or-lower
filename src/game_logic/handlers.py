@@ -19,7 +19,7 @@ from events import (
 from p2p import broadcast, send_to, get_local_id, get_leader_id, get_player_ids
 
 
-# ------------------ DEDUP ------------------
+
 seen_events = set()
 
 
@@ -72,7 +72,7 @@ def handle_event(event):
         handle_state_snapshot(payload)
 
 
-# ================= LEADER-ONLY HELPERS =================
+# leader helpers
 
 def _leader_only():
     return get_local_id() == get_leader_id()
@@ -97,6 +97,9 @@ def _leader_reconcile_membership():
     game_state["players"].sort()
 
 
+
+
+
 def _leader_advance_turn(from_pid):
     """Leader-only deterministic successor."""
     players = game_state.get("players", [])
@@ -114,7 +117,10 @@ def _leader_advance_turn(from_pid):
     broadcast(make_event(EVENT_TURN_START, {"player": nxt}, sender=get_local_id()))
 
 
-# ================= EVENT HANDLERS =================
+
+
+
+#hendlers for events
 
 def handle_game_start(payload):
     game_state["players"] = sorted(payload["players"])
@@ -137,10 +143,14 @@ def handle_deck_reveal(payload):
     game_state["current_card"] = card
 
 
+
+
 def handle_turn_start(payload):
-    # FOLLOWERS ONLY APPLY — NEVER FIX
+  
     game_state["current_turn"] = payload["player"]
     print(f"[GAME] Turn start for player {payload['player']}")
+
+
 
 
 def handle_guess(payload, sender):
@@ -179,6 +189,9 @@ def handle_guess(payload, sender):
     _leader_advance_turn(sender)
 
 
+
+
+
 def handle_player_join(payload):
     pid = payload["player_id"]
     if pid not in game_state["players"]:
@@ -205,7 +218,7 @@ def handle_new_leader():
         _leader_advance_turn(game_state["players"][0])
 
 
-# ================= SNAPSHOT =================
+#snapshot!
 
 def handle_state_request(sender):
     if not _leader_only():
@@ -233,5 +246,3 @@ def handle_state_snapshot(payload):
     game_state["revealed_cards"] = game_state["deck"][:snap["revealed_n"]]
     game_state["current_card"] = snap["current_card"]
     game_state["current_turn"] = snap["current_turn"]
-
-    # 🚨 FOLLOWERS DO NOT FIX TURNS
