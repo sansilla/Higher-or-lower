@@ -34,10 +34,10 @@ def handle_event(event):
         return
     seen_events.add(key)
 
-    event_log.append(event)
+    event_log.append(event) #keep in mem history
 
     
-    log_event(event)
+    log_event(event) #persistent
 
 
 
@@ -102,7 +102,7 @@ def _leader_reconcile_membership():
 
 
 
-
+#choose next player and broadcast turn start
 
 def _leader_advance_turn(from_pid):
     
@@ -153,7 +153,6 @@ def handle_deck_reveal(payload):
     print(f"[GAME] Card revealed: {card_str(card)}")
     game_state["revealed_cards"].append(card)
     game_state["current_card"] = card
-
 
 
 
@@ -248,7 +247,8 @@ def handle_state_request(sender):
 
     send_to(sender, make_event(EVENT_STATE_SNAPSHOT, {"snapshot": snap}, sender=get_local_id()))
 
-
+#
+#for game state restoration from snapshot
 def handle_state_snapshot(payload):
     snap = payload["snapshot"]
 

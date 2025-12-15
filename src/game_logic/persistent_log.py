@@ -5,7 +5,7 @@ import time
 
 _LOG_FP = None
 
-def init_persistent_log(node_id: int, base_dir: str = "logs"):
+def init_persistent_log(node_id: int, base_dir: str = "logs"): #log file init
     global _LOG_FP
     os.makedirs(base_dir, exist_ok=True)
     path = os.path.join(base_dir, f"node_{node_id}.jsonl")
@@ -16,5 +16,5 @@ def init_persistent_log(node_id: int, base_dir: str = "logs"):
 def log_event(event: dict):
     if _LOG_FP is None:
         return
-    _LOG_FP.write(json.dumps(event) + "\n")
+    _LOG_FP.write(json.dumps(event) + "\n")             #event writing to file
     _LOG_FP.flush()
