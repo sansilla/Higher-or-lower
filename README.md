@@ -17,7 +17,7 @@
 
 You can test the connection by running the following commands in separate terminals:
 
-**1st terminal (server):**
+**1st terminal main node (bootstrap):**
 
 ```bash
 python3 server.py
@@ -28,3 +28,7 @@ python3 server.py
 ```bash
 python3 pygame_client.py "username"
 ```
+
+
+IMPORTANT!!!
+If running on multiple devices, set BOOTSTRAP_HOST in pygame_client.py to the server machine’s LAN IP.
